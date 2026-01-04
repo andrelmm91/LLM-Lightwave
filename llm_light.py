@@ -8,6 +8,7 @@ import random
 import os
 import tiktoken 
 import argparse
+from datetime import datetime
 
 # ────────────────────────────────────────────────────────────────
 #  Hyperparameters
@@ -15,12 +16,12 @@ import argparse
 MAX_N = 512
 M = 8                # evolution steps per token
 H = 4
-COUPLING = 0.99
+COUPLING = 0.12
 EPS = 1e-8
 SEQ_LEN = 128
 BATCH_SIZE = 8
 EPOCHS = 15
-# STEPS_PER_EPOCH = 200
+STEPS_PER_EPOCH = 200
 LR = 4e-4
 REL_MAX_DIST = 64
 
@@ -147,19 +148,52 @@ class ReadoutHead(torch.nn.Module):
         x = torch.view_as_real(z).flatten(start_dim=-2)
         return self.proj(x)
 
+class QuantumWaveModulator(torch.nn.Module):
+    """
+    Fixed Unitary Modulator based on Discrete-time Quantum Random Walk.
+    Matrix: 1/sqrt(2) * [[1, i], [i, 1]]
+    """
+    def __init__(self):
+        super().__init__()
+        # Coin matrix
+        self.register_buffer("coin", torch.tensor([
+            [1.0 + 0.0j, 0.0 + 1.0j],
+            [0.0 + 1.0j, 1.0 + 0.0j]
+        ], dtype=torch.complex64) / (2.0**0.5))
+
+    def forward(self, curr_pos, z_curr, z_past):
+        if z_past.numel() == 0:
+            return torch.zeros_like(z_curr)
+            
+        # Implementation of the shift + coin interference logic.
+        # Let's take u from history and v from current stimuli
+        u_prev = z_past[-1, 0]
+        v_curr = z_curr[1]
+        
+        # Apply Coin with coupling
+        state = torch.stack([u_prev, v_curr])
+        # User: "multiply the coupling in the coin vector"
+        out = (self.coin * COUPLING) @ state
+        
+        return out
+
 # Instantiate
 token_embed = TokenEmbedding(VOCAB_SIZE).to(DEVICE)
 pos_bias = RelativePositionalBias().to(DEVICE)
-modulator = MultiHeadModulator().to(DEVICE)  # assume same as previous
-readout = ReadoutHead().to(DEVICE)           # output to VOCAB_SIZE logits
+modulator_neural = MultiHeadModulator().to(DEVICE)
+modulator_wave = QuantumWaveModulator().to(DEVICE)
+readout = ReadoutHead().to(DEVICE)
 
-optimizer = optim.Adam(
-    list(token_embed.parameters()) +
-    list(pos_bias.parameters()) +
-    list(modulator.parameters()) +
-    list(readout.parameters()),
-    lr=LR
-)
+# Will be set by CLI
+current_mode = "neural" 
+
+def get_params():
+    params = list(token_embed.parameters()) + list(pos_bias.parameters()) + list(readout.parameters())
+    if current_mode == "neural":
+        params += list(modulator_neural.parameters())
+    return params
+
+optimizer = optim.Adam(get_params(), lr=LR)
 scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=LR*0.05)
 
 # ────────────────────────────────────────────────────────────────
@@ -172,10 +206,14 @@ def incremental_evolve_step(candidate, z_cache, i):
     else:
         past = torch.stack(z_cache) # [N, dim]
 
-    # Evolution: Modulate based on interaction with past
-    mod = modulator(i, candidate, past)
-    
-    return candidate + COUPLING * mod
+    if current_mode == "wave":
+        mod = modulator_wave(i, candidate, past)
+        # In wave mode, the interference IS the next state
+        # We add a residual from candidate for the non-coupled part
+        return mod + (1 - COUPLING) * candidate
+    else:
+        mod = modulator_neural(i, candidate, past)
+        return candidate + COUPLING * mod
 
 # ────────────────────────────────────────────────────────────────
 #  Forward pass (teacher forcing) - adapted for subword tokens
@@ -202,30 +240,57 @@ def forward_incremental(token_ids: torch.Tensor):
 # ────────────────────────────────────────────────────────────────
 #  Check-pointing
 # ────────────────────────────────────────────────────────────────
-def save_checkpoint(path="model.pth"):
+def save_checkpoint(path=None):
     checkpoint = {
         'token_embed': token_embed.state_dict(),
         'pos_bias': pos_bias.state_dict(),
-        'modulator': modulator.state_dict(),
+        'modulator_neural': modulator_neural.state_dict(),
         'readout': readout.state_dict(),
         'optimizer': optimizer.state_dict(),
-        'scheduler': scheduler.state_dict()
+        'scheduler': scheduler.state_dict(),
+        'mode': current_mode
     }
-    torch.save(checkpoint, path)
-    print(f"Checkpoint saved to {path}")
+    
+    # Standard latest file
+    torch.save(checkpoint, "model.pth")
+    
+    # Timestamped specific file
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    dynamic_path = f"model_{current_mode}_{timestamp}.pth"
+    torch.save(checkpoint, dynamic_path)
+    
+    print(f"Checkpoints saved: model.pth and {dynamic_path}")
 
 def load_checkpoint(path="model.pth"):
+    global current_mode, optimizer, scheduler
     if not os.path.exists(path):
         print(f"No checkpoint found at {path}")
         return False
-    checkpoint = torch.load(path, map_location=DEVICE)
+    
+    # We use weights_only=False because the checkpoint contains optimizer/scheduler states
+    checkpoint = torch.load(path, map_location=DEVICE, weights_only=False)
+    
+    saved_mode = checkpoint.get('mode', 'neural')
+    if saved_mode != current_mode:
+        print(f"Checkpoint mode ({saved_mode}) differs from current mode ({current_mode}). Switching...")
+        current_mode = saved_mode
+        # Re-initialize optimizer and scheduler with the correct parameters for this mode
+        optimizer = optim.Adam(get_params(), lr=LR)
+        scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=LR*0.05)
+        
     token_embed.load_state_dict(checkpoint['token_embed'])
     pos_bias.load_state_dict(checkpoint['pos_bias'])
-    modulator.load_state_dict(checkpoint['modulator'])
+    if 'modulator_neural' in checkpoint and saved_mode == 'neural':
+        modulator_neural.load_state_dict(checkpoint['modulator_neural'])
     readout.load_state_dict(checkpoint['readout'])
-    optimizer.load_state_dict(checkpoint['optimizer'])
-    scheduler.load_state_dict(checkpoint['scheduler'])
-    print(f"Checkpoint loaded from {path}")
+    
+    try:
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        scheduler.load_state_dict(checkpoint['scheduler'])
+    except ValueError as e:
+        print(f"Warning: Could not load optimizer state due to mismatch ({e}). Using freshly initialized optimizer.")
+
+    print(f"Checkpoint loaded from {path} (Mode: {saved_mode})")
     return True
 
 # ────────────────────────────────────────────────────────────────
@@ -237,8 +302,8 @@ def train():
         total_loss = 0.0
         steps = 0
 
-        with tqdm(total=200, desc=f"Epoch {epoch+1}/{EPOCHS}") as pbar:  # ~200 steps/epoch
-            while steps < 200:
+        with tqdm(total=STEPS_PER_EPOCH, desc=f"Epoch {epoch+1}/{EPOCHS}") as pbar:
+            while steps < STEPS_PER_EPOCH:
                 seq = get_random_chunk(SEQ_LEN)
                 logits = forward_incremental(seq)
                 target = seq[1:]
@@ -250,10 +315,7 @@ def train():
                 pbar.update(1)
                 pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-        torch.nn.utils.clip_grad_norm_(list(token_embed.parameters()) +
-                                       list(pos_bias.parameters()) +
-                                       list(modulator.parameters()) +
-                                       list(readout.parameters()), 1.0)
+        torch.nn.utils.clip_grad_norm_(get_params(), 1.0)
         optimizer.step()
         optimizer.zero_grad()
         scheduler.step()
@@ -311,11 +373,23 @@ if __name__ == "__main__":
     parser.add_argument("--train", action="store_true", help="Start training")
     parser.add_argument("--generate", action="store_true", help="Generate text")
     parser.add_argument("--load", action="store_true", help="Load checkpoint before running")
+    parser.add_argument("--checkpoint", type=str, default="model.pth", help="Path to specific checkpoint file")
+    parser.add_argument("--mode", type=str, choices=["neural", "wave"], default="neural", help="Modulator mode")
+    parser.add_argument("--epochs", type=int, default=EPOCHS, help="Number of training epochs")
+    parser.add_argument("--steps", type=int, default=200, help="Steps per epoch")
     parser.add_argument("--prompt", type=str, default="Once upon a time there was a little girl who loved to", help="Prompt for generation")
     args = parser.parse_args()
 
+    current_mode = args.mode
+    EPOCHS = args.epochs
+    STEPS_PER_EPOCH = args.steps
+    
+    # Re-init optimizer if we changed mode (to include/exclude neural modulator params)
+    optimizer = optim.Adam(get_params(), lr=LR)
+    scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=LR*0.05)
+
     if args.load:
-        load_checkpoint()
+        load_checkpoint(args.checkpoint)
 
     if args.train:
         train()

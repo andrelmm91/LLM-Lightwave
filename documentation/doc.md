@@ -31,6 +31,48 @@ The model is designed as a **Dynamical System**. Each token acts as an impulse t
 | **Constant-Time Inference** | Because it evolves the state incrementally, generating the next token is extremely fast and doesn't require re-processing the entire sequence history like some traditional models. |
 | **Memory Efficiency** | The `z_cache` approach stores historical context as a compressed complex state rather than a growing set of KD/V vectors. |
 
+## Modes: Neural vs. Quantum Wave
+I have implemented two distinct modes for the core dynamics:
+
+### 1. Neural Modulator (`--mode neural`)
+*   **Mechanism**: Learned multi-head attention-like interaction.
+*   **Trainable Parameters**: ~8,000 in the modulator.
+
+### 2. Quantum Wave Modulator (`--mode wave`)
+*   **Mechanism**: Strictly follows your QRW equation:
+    $\begin{pmatrix} u \\ v \end{pmatrix}_{next} = \frac{1}{\sqrt{2}} \begin{pmatrix} 1 & i \\ i & 1 \end{pmatrix} \begin{pmatrix} u_{past} \\ v_{curr} \end{pmatrix}$
+*   **Trainable Parameters**: **ZERO**. Only Embeddings/Readout are trained.
+
+## Usage
+- **Neural**: `python llm_light.py --train --mode neural`
+- **Quantum Wave**: `python llm_light.py --train --mode wave`
+
+## Code Deep Dive: Interference with Neighbour States
+The "interference" or interaction between states (neighbouring tokens) is handled in the [MultiHeadModulator](file:///c:/Users/andre/OneDrive/Documentos/dev/LLM_lightwave/llm_light.py#88-139) class. 
+
+In this architecture, the current token state (`z_curr`) "interferes" with the entire history of past states (`z_past`) to determine the next evolutionary nudge.
+
+```python
+# llm_light.py:L107-123
+# 1. Broaden current state to match history length
+z_curr_rep = z_curr.unsqueeze(0).expand(past_len, -1) 
+
+# 2. Concatenate every history state with the current state (The Interference)
+features_c = torch.cat([z_curr_rep, z_past], dim=-1)
+
+# 3. Process through multiple heads (Interference patterns)
+for head in self.heads:
+    h = torch.tanh(head(features)) # Nonlinear interaction
+    head_outs.append(h)
+
+# 4. Aggregate findings (The resulting modulation)
+combined_mean = combined.mean(dim=0) 
+```
+
+### Automated Tests
+- Run `python llm_light.py --mode wave --train --epochs 1` to verify it can learn with a fixed wave core.
+- Compare the loss curves (neural vs. wave).
+
 ## Command Line Interface
 
 Command Line Interface: You can now run the script with specific flags:
