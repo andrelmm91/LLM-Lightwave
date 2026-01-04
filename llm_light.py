@@ -19,6 +19,7 @@ EPS = 1e-8
 SEQ_LEN = 128
 BATCH_SIZE = 8
 EPOCHS = 15
+# STEPS_PER_EPOCH = 200
 LR = 4e-4
 REL_MAX_DIST = 64
 
@@ -44,7 +45,7 @@ def get_random_chunk(length=SEQ_LEN):
 #  Load TinyStories (download manually from HF)
 # ────────────────────────────────────────────────────────────────
 # DATA_PATH = "debug_data.txt"  # for quick testing
-DATA_PATH = "TinyStories-train.txt"
+DATA_PATH = "TinyStories-train.txt"  # ← place downloaded file here
 
 if not os.path.exists(DATA_PATH):
     raise FileNotFoundError(
@@ -249,19 +250,25 @@ def generate(prompt: str, max_new=180, temperature=0.92):
 
     current_pos = len(prompt_tokens)
     for _ in range(max_new):
-        prev = z_cache[-1]
-        candidate = prev + 0.12 * torch.randn_like(prev)  # some noise
-        z_new = incremental_evolve_step(candidate, z_cache, current_pos)
-
-        logits = readout(z_new) / temperature
-        next_token = F.softmax(logits, dim=-1).argmax()
-
+        # The last state in cache predicts the next token
+        z_current = z_cache[-1]
+        logits = readout(z_current) / temperature
+        
+        # Sample next token
+        probs = F.softmax(logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1) # [1]
+        
+        # Append to results
         generated_tokens = torch.cat([generated_tokens, next_token])
-        z_cache.append(z_new)
-        current_pos += 1
-
+        
         if next_token.item() == tokenizer.eot_token:
             break
+
+        # Feed back as next embedding
+        candidate = token_embed(next_token).squeeze(0)
+        z_next = incremental_evolve_step(candidate, z_cache, current_pos)
+        z_cache.append(z_next)
+        current_pos += 1
 
     return tokenizer.decode(generated_tokens.tolist())
 
