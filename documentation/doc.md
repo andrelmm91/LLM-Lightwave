@@ -64,7 +64,7 @@ This mode has **Zero** trainable parameters in the modulator core, relying on pu
 
 ### Example Commands
 - **Train Depth-8 Wave Model**: `python llm_light.py --train --mode wave --layers 8`
-- **Generate from Specific Version**: `python llm_light.py --generate --load --checkpoint model --prompt "there was a dog"`
+- **Generate from Specific Version**: `python llm_light.py --generate --load --checkpoint model.pTh --prompt "there was a dog"`
 
 ---
 
