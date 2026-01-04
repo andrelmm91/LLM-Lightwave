@@ -6,139 +6,188 @@ import numpy as np
 from tqdm import tqdm
 import random
 import os
+import tiktoken 
 
 # ────────────────────────────────────────────────────────────────
 #  Hyperparameters
 # ────────────────────────────────────────────────────────────────
 MAX_N = 512
-M = 32                # evolution steps per token
+M = 8                # evolution steps per token
 H = 4
 COUPLING = 0.12
 EPS = 1e-8
-VOCAB_SIZE = 96      # increased for real text (basic ASCII + common chars)
 SEQ_LEN = 128
 BATCH_SIZE = 8
-EPOCHS = 25          # adjust according to your compute
-LR = 6e-4
-REL_MAX_DIST = 64    # for relative positional bias clipping
-DATA_PATH = "TinyStories-train.txt"  # ← download from HF!
+EPOCHS = 15
+LR = 4e-4
+REL_MAX_DIST = 64
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
 
 # ────────────────────────────────────────────────────────────────
-#  Load real TinyStories text
+#  Real tokenizer: tiktoken GPT-2 style
 # ────────────────────────────────────────────────────────────────
-def load_tinystories(path=DATA_PATH):
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"TinyStories-train.txt not found!\n"
-            "Download from: https://huggingface.co/datasets/roneneldan/TinyStories\n"
-            "(use TinyStories-train.txt ~1-2GB)"
-        )
-    with open(path, 'r', encoding='utf-8') as f:
-        text = f.read()
-    print(f"Loaded TinyStories text: {len(text):,} characters")
-    return text
-
-full_text = load_tinystories()
-
-# Simple character-level tokenizer (good enough for toy)
-chars = sorted(list(set(full_text)))
-VOCAB_SIZE = len(chars)
-char_to_idx = {ch: i for i, ch in enumerate(chars)}
-idx_to_char = {i: ch for i, ch in enumerate(chars)}
+tokenizer = tiktoken.get_encoding("gpt2")
+VOCAB_SIZE = tokenizer.n_vocab  # ~50257
 
 def get_random_chunk(length=SEQ_LEN):
+    """Sample random contiguous chunk from TinyStories text"""
     start = random.randint(0, len(full_text) - length - 1)
     chunk = full_text[start:start + length]
-    return torch.tensor([char_to_idx[c] for c in chunk], dtype=torch.long, device=DEVICE)
+    tokens = torch.tensor(tokenizer.encode(chunk, disallowed_special=()), dtype=torch.long, device=DEVICE)
+    if len(tokens) < length:
+        tokens = F.pad(tokens, (0, length - len(tokens)), value=tokenizer.eot_token)
+    return tokens[:length]
 
 # ────────────────────────────────────────────────────────────────
-#  Modules
+#  Load TinyStories (download manually from HF)
 # ────────────────────────────────────────────────────────────────
+# DATA_PATH = "debug_data.txt"  # for quick testing
+DATA_PATH = "TinyStories-train.txt"
+
+if not os.path.exists(DATA_PATH):
+    raise FileNotFoundError(
+        "Download TinyStories-train.txt from:\n"
+        "https://huggingface.co/datasets/roneneldan/TinyStories\n"
+        "(or TinyStoriesV2-GPT4-train.txt for GPT-4 only version)"
+    )
+
+with open(DATA_PATH, 'r', encoding='utf-8') as f:
+    full_text = f.read()
+
+print(f"Loaded TinyStories: {len(full_text):,} characters | ~{len(full_text)//4:,} tokens")
+
+# ────────────────────────────────────────────────────────────────
+#  Modules (same as before + token embedding)
+# ────────────────────────────────────────────────────────────────
+class TokenEmbedding(torch.nn.Module):
+    """Project token ids to complex domain"""
+    def __init__(self, vocab_size, dim=2):
+        super().__init__()
+        self.dim = dim
+        self.embed = torch.nn.Embedding(vocab_size, dim * 2)  # real + imag
+
+    def forward(self, ids):
+        emb = self.embed(ids)           # [..., dim*2]
+        return emb[..., :self.dim] + 1j * emb[..., self.dim:]  # complex
+
 class RelativePositionalBias(torch.nn.Module):
-    """Trainable relative positional bias (complex-valued)"""
     def __init__(self, max_rel_dist=REL_MAX_DIST):
         super().__init__()
-        # Bias for relative distances -2*max ... +2*max
         size = 2 * max_rel_dist + 1
         self.bias = torch.nn.Parameter(torch.randn(size, dtype=torch.complex64) * 0.02)
 
     def get_bias(self, rel_dist):
-        # rel_dist can be tensor of shape [...]
         idx = rel_dist + REL_MAX_DIST
         idx = torch.clamp(idx, 0, len(self.bias) - 1)
         return self.bias[idx]
 
 class MultiHeadModulator(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, dim=2, heads=H):
         super().__init__()
-        self.heads = torch.nn.ModuleList([torch.nn.Linear(4, 2) for _ in range(H)])
-        self.out_proj = torch.nn.Linear(H*2, 2)
+        self.dim = dim
+        self.heads = torch.nn.ModuleList([
+            torch.nn.Linear(dim * 2 * 2, dim * 2) for _ in range(heads)
+        ])
+        self.out_proj = torch.nn.Linear(heads * dim * 2, dim * 2)
         self.rel_bias = RelativePositionalBias()
 
     def forward(self, curr_pos: int, z_curr, z_past):
         if z_past.numel() == 0:
-            return torch.zeros(2, device=DEVICE, dtype=torch.float32)
+            return torch.zeros(self.dim, device=DEVICE, dtype=torch.complex64)
 
         past_len = z_past.size(0)
-        rel_dists = torch.arange(curr_pos - past_len, curr_pos, device=DEVICE)  # [past_len]
-        rel_biases = self.rel_bias.get_bias(rel_dists)  # [past_len] complex
-
-        # Features: (Real, Imag) for both curr and past
-        z_curr_feat = torch.stack([z_curr.real, z_curr.imag], dim=-1) # [1, 2]
-        z_past_feat = torch.stack([z_past.real, z_past.imag], dim=-1) # [past_len, 2]
         
-        # Expand curr to match past
-        features = torch.cat([z_curr_feat.repeat(past_len, 1), z_past_feat], dim=-1) # [past_len, 4]
+        # Prepare inputs
+        z_curr_rep = z_curr.unsqueeze(0).expand(past_len, -1) # [N, dim]
         
-        head_outs = [torch.tanh(head(features)) for head in self.heads] # List of [past_len, 2]
-        combined = torch.cat(head_outs, dim=-1).mean(dim=0, keepdim=True) # [1, H*2] (Mean over past_len)
-
-        mod_out = self.out_proj(combined).squeeze() # [2] (Real, Imag vector)
+        # Concatenate features: [N, 2*dim] complex
+        features_c = torch.cat([z_curr_rep, z_past], dim=-1)
         
-        # Combine mod_out (float vector) with rel_biases (complex tensor)
-        # Convert mod_out to complex scalar
-        mod_complex = torch.complex(mod_out[0], mod_out[1])
+        # View as real: [N, 2*dim * 2] floats
+        # view_as_real adds a last dim of 2. Flatten that.
+        features = torch.view_as_real(features_c).flatten(start_dim=-2)
         
-        # Add average relative bias (simple aggregation)
-        final_mod = mod_complex + rel_biases.mean()
+        # Heads
+        head_outs = []
+        for head in self.heads:
+            h = torch.tanh(head(features)) # [N, dim*2]
+            head_outs.append(h)
+            
+        # Cat heads: [N, H * dim * 2]
+        combined = torch.cat(head_outs, dim=-1)
         
-        return final_mod
+        # Aggregate over past (mean)
+        combined_mean = combined.mean(dim=0) # [H * dim * 2]
+        
+        # Output projection
+        out = self.out_proj(combined_mean) # [dim * 2]
+        
+        # Back to complex
+        mod = torch.view_as_complex(out.view(self.dim, 2))
+        
+        # Bias
+        rel_dists = torch.arange(curr_pos - past_len, curr_pos, device=DEVICE)
+        biases = self.rel_bias.get_bias(rel_dists) # [N]
+        # Expand biases to [dim]? It is scalar complex.
+        # Broadcasting handles it.
+        
+        return mod + biases.mean()
 
 class ReadoutHead(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, dim=2, vocab_size=VOCAB_SIZE):
         super().__init__()
-        self.proj = torch.nn.Linear(2, VOCAB_SIZE)
+        self.proj = torch.nn.Linear(dim * 2, vocab_size)
 
     def forward(self, z):
-        features = torch.stack([z.real, z.imag], dim=-1)
-        return self.proj(features)
+        # z: [..., dim] complex
+        x = torch.view_as_real(z).flatten(start_dim=-2)
+        return self.proj(x)
 
 # Instantiate
-modulator = MultiHeadModulator().to(DEVICE)
-readout = ReadoutHead().to(DEVICE)
+token_embed = TokenEmbedding(VOCAB_SIZE).to(DEVICE)
+pos_bias = RelativePositionalBias().to(DEVICE)
+modulator = MultiHeadModulator().to(DEVICE)  # assume same as previous
+readout = ReadoutHead().to(DEVICE)           # output to VOCAB_SIZE logits
 
 optimizer = optim.Adam(
-    list(modulator.parameters()) + list(readout.parameters()),
-    lr=LR, betas=(0.9, 0.98), weight_decay=1e-5
+    list(token_embed.parameters()) +
+    list(pos_bias.parameters()) +
+    list(modulator.parameters()) +
+    list(readout.parameters()),
+    lr=LR
 )
 scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=LR*0.05)
 
 # ────────────────────────────────────────────────────────────────
-#  Forward pass (teacher forcing, incremental)
+#  Evolution Step
 # ────────────────────────────────────────────────────────────────
-def forward_incremental(indices: torch.Tensor):
-    seq_len = indices.size(0)
+def incremental_evolve_step(candidate, z_cache, i):
+    # Retrieve previous state
+    if not z_cache:
+        past = torch.empty(0, 2, device=DEVICE, dtype=torch.complex64)
+    else:
+        past = torch.stack(z_cache) # [N, dim]
+
+    # Evolution: Modulate based on interaction with past
+    mod = modulator(i, candidate, past)
+    
+    return candidate + mod
+
+# ────────────────────────────────────────────────────────────────
+#  Forward pass (teacher forcing) - adapted for subword tokens
+# ────────────────────────────────────────────────────────────────
+def forward_incremental(token_ids: torch.Tensor):
+    seq_len = token_ids.size(0)
     z_cache = []
     logits_list = []
 
     for i in range(seq_len):
-        target_idx = indices[i]
-        candidate = 0.35 * torch.randn((), device=DEVICE, dtype=torch.complex64)
+        # Embed current token
+        candidate = token_embed(token_ids[i:i+1]).squeeze(0)
 
-        z_new = incremental_evolve_step(candidate, z_cache, i)
+        z_new = incremental_evolve_step(candidate, z_cache, i)  # from previous version
 
         if i < seq_len - 1:
             logits = readout(z_new)
@@ -146,84 +195,75 @@ def forward_incremental(indices: torch.Tensor):
 
         z_cache.append(z_new)
 
-    return torch.stack(logits_list)
-
-# Reuse incremental_evolve_step from previous version (adapted)
-def incremental_evolve_step(candidate, z_cache, pos):
-    if z_cache:
-        z_past = torch.stack(z_cache)
-        # Modulator now returns a complex scalar
-        mod_factor = modulator(pos, candidate.unsqueeze(0), z_past)
-        interf = COUPLING * mod_factor * z_past.mean()
-        z_new = candidate + interf
-    else:
-        z_new = candidate
-
-    z_new = torch.tanh(z_new.real) + 1j * torch.tanh(z_new.imag)
-    max_int = torch.max(torch.abs(z_new)**2)
-    if max_int > 0:
-        z_new = z_new * (1.0 / torch.sqrt(max_int))
-    return z_new
+    return torch.stack(logits_list)  # [seq_len-1, VOCAB_SIZE]
 
 # ────────────────────────────────────────────────────────────────
-#  Training Loop
+#  Training loop (same structure, real chunks)
 # ────────────────────────────────────────────────────────────────
 def train():
-    print("Starting training on TinyStories...")
+    print("Training started on TinyStories with real BPE tokenizer...")
     for epoch in range(EPOCHS):
         total_loss = 0.0
-        optimizer.zero_grad()
+        steps = 0
 
-        for _ in tqdm(range(BATCH_SIZE * 4), desc=f"Epoch {epoch+1}/{EPOCHS}"):  # many steps per epoch
-            seq = get_random_chunk(SEQ_LEN)
-            logits = forward_incremental(seq)  # [seq_len-1, VOCAB_SIZE]
-            target = seq[1:]
+        with tqdm(total=200, desc=f"Epoch {epoch+1}/{EPOCHS}") as pbar:  # ~200 steps/epoch
+            while steps < 200:
+                seq = get_random_chunk(SEQ_LEN)
+                logits = forward_incremental(seq)
+                target = seq[1:]
 
-            loss = F.cross_entropy(logits, target, reduction='mean')
-            loss.backward()
-            total_loss += loss.item()
+                loss = F.cross_entropy(logits, target, ignore_index=tokenizer.eot_token)
+                loss.backward()
+                total_loss += loss.item()
+                steps += 1
+                pbar.update(1)
+                pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-        torch.nn.utils.clip_grad_norm_(list(modulator.parameters()) + list(readout.parameters()), 1.0)
+        torch.nn.utils.clip_grad_norm_(list(token_embed.parameters()) +
+                                       list(pos_bias.parameters()) +
+                                       list(modulator.parameters()) +
+                                       list(readout.parameters()), 1.0)
         optimizer.step()
+        optimizer.zero_grad()
         scheduler.step()
 
-        print(f"Epoch [{epoch+1}/{EPOCHS}]  Avg loss: {total_loss/(BATCH_SIZE*4):.4f}  LR: {scheduler.get_last_lr()[0]:.6f}")
+        print(f"Epoch {epoch+1:2d}  Avg loss: {total_loss/steps:.4f}  LR: {scheduler.get_last_lr()[0]:.6f}")
 
     print("Training finished.")
 
 # ────────────────────────────────────────────────────────────────
-#  Generation (same as before, greedy)
+#  Generation with real tokenizer
 # ────────────────────────────────────────────────────────────────
 @torch.no_grad()
-def generate(prompt: str, max_new=120, temperature=0.9):
-    prompt_idx = torch.tensor([char_to_idx.get(c, 0) for c in prompt.lower()], device=DEVICE)
+def generate(prompt: str, max_new=180, temperature=0.92):
+    prompt_tokens = torch.tensor(tokenizer.encode(prompt), device=DEVICE)
     z_cache = []
-    generated = prompt_idx.clone()
 
     # Prefill
-    for i in range(len(prompt_idx)):
-        candidate = 0.35 * torch.randn((), device=DEVICE, dtype=torch.complex64)
+    for i, tok_id in enumerate(prompt_tokens):
+        candidate = token_embed(tok_id.unsqueeze(0)).squeeze(0)
         z = incremental_evolve_step(candidate, z_cache, i)
         z_cache.append(z)
 
-    # Generate
-    current_pos = len(prompt_idx)
+    generated_tokens = prompt_tokens.clone()
+
+    current_pos = len(prompt_tokens)
     for _ in range(max_new):
         prev = z_cache[-1]
-        candidate = prev + 0.15 * torch.randn_like(prev)
+        candidate = prev + 0.12 * torch.randn_like(prev)  # some noise
         z_new = incremental_evolve_step(candidate, z_cache, current_pos)
 
         logits = readout(z_new) / temperature
         next_token = F.softmax(logits, dim=-1).argmax()
 
-        generated = torch.cat([generated, next_token.unsqueeze(0)])
+        generated_tokens = torch.cat([generated_tokens, next_token])
         z_cache.append(z_new)
         current_pos += 1
 
-        if next_token.item() == char_to_idx.get(' ', 0):
+        if next_token.item() == tokenizer.eot_token:
             break
 
-    return "".join(idx_to_char.get(i.item(), "?") for i in generated)
+    return tokenizer.decode(generated_tokens.tolist())
 
 # ────────────────────────────────────────────────────────────────
 #  Run
@@ -231,8 +271,8 @@ def generate(prompt: str, max_new=120, temperature=0.9):
 if __name__ == "__main__":
     train()
 
-    print("\n" + "="*80)
-    prompt = "Once upon a time there was a little"
-    print(f"Prompt: {repr(prompt)}")
-    generated = generate(prompt)
-    print(f"Generated: {repr(generated)}")
+    print("\n" + "="*90)
+    test_prompt = "Once upon a time there was a little girl who loved to"
+    print(f"Test prompt: {test_prompt!r}")
+    generated = generate(test_prompt)
+    print(f"Generated continuation:\n{generated}")
