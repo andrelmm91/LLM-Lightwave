@@ -3,146 +3,161 @@ import torch.nn.functional as F
 import numpy as np
 
 # ────────────────────────────────────────────────────────────────
-#  Hyperparameters
+#  Hyperparameters - scaled up
 # ────────────────────────────────────────────────────────────────
-N = 32              # sequence length
-M = 6               # number of evolution steps
-COUPLING = 0.10     # base coupling strength
+N = 128             # sequence length (longer context demo)
+M = 12              # more evolution steps (deeper "layers")
+COUPLING = 0.10
 EPS = 1e-8
+VOCAB_SIZE = 32     # tiny vocab for demo
+READOUT_DIM = 32    # readout projects to vocab logits
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
 # ────────────────────────────────────────────────────────────────
-#  Encoding helper functions
+#  Tiny artificial vocabulary & encoding
 # ────────────────────────────────────────────────────────────────
-def text_to_complex(text: str, n: int = N) -> torch.Tensor:
-    """Very simple char → complex encoding (for demo)"""
-    text = (text + " " * n)[:n]  # pad/truncate
-    indices = torch.tensor([ord(c) % 100 for c in text], dtype=torch.float32, device=device)
-    amps = indices / 100.0
-    phases = 2 * torch.pi * (indices / 100.0) - torch.pi
-    return amps * torch.exp(1j * phases)
+vocab = list(" abcdefghijklmnopqrstuvwxyz012345")  # 0-25 letters + space + digits + specials
+char_to_idx = {c: i for i, c in enumerate(vocab)}
+idx_to_char = {i: c for c, i in char_to_idx.items()}
 
-def complex_to_text(z: torch.Tensor) -> str:
-    """Naive phase → char decoding"""
-    phases = torch.angle(z)
-    indices = ((phases + torch.pi) / (2 * torch.pi) * 100).round().long().cpu().tolist()
-    chars = [chr(i % 128) for i in indices]
-    return "".join(chars).rstrip()
+def text_to_indices(text: str, n: int = N) -> torch.Tensor:
+    text = (text.lower() + " " * n)[:n]
+    return torch.tensor([char_to_idx.get(c, 0) for c in text], dtype=torch.long, device=device)
+
+def indices_to_text(indices: torch.Tensor) -> str:
+    return "".join(idx_to_char.get(i.item(), "?") for i in indices).rstrip()
 
 # ────────────────────────────────────────────────────────────────
-#  Core forward evolution (differentiable!)
+#  Readout head (learnable)
 # ────────────────────────────────────────────────────────────────
-def evolve(u0: torch.Tensor, v0: torch.Tensor, return_all=False):
+class ReadoutHead(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = torch.nn.Linear(2, VOCAB_SIZE, bias=True)  # real+imag → logits
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        # z: [N] complex → stack real/imag → [N, 2]
+        features = torch.stack([z.real, z.imag], dim=-1)    # [N, 2]
+        logits = self.proj(features)                        # [N, VOCAB_SIZE]
+        return logits
+
+readout = ReadoutHead().to(device)
+
+# ────────────────────────────────────────────────────────────────
+#  Evolution (same as before, now with larger N/M)
+# ────────────────────────────────────────────────────────────────
+def evolve(u0: torch.Tensor, v0: torch.Tensor):
     u = [u0.clone()]
     v = [v0.clone()]
 
     for m in range(M):
-        # Absorbing boundaries → pad with zeros
-        u_left = torch.cat([torch.zeros(1, device=device), u[-1][:-1]])
-        v_left = torch.cat([torch.zeros(1, device=device), v[-1][:-1]])
+        u_left  = torch.cat([torch.zeros(1, device=device), u[-1][:-1]])
+        v_left  = torch.cat([torch.zeros(1, device=device), v[-1][:-1]])
         u_right = torch.cat([u[-1][1:], torch.zeros(1, device=device)])
         v_right = torch.cat([v[-1][1:], torch.zeros(1, device=device)])
 
-        # Per-neighbor phase/amplitude modulation
-        z_left = u_left + 1j * v_left
         z_curr = u[-1] + 1j * v[-1]
+        z_left  = u_left + 1j * v_left
+        z_right = u_right + 1j * v_right
+
+        # Modulation
         phase_diff_u = torch.angle(z_left) - torch.angle(z_curr)
-        amp_ratio_u = torch.abs(z_left) / (torch.abs(z_curr) + EPS)
+        amp_ratio_u  = torch.abs(z_left) / (torch.abs(z_curr) + EPS)
         mod_u = torch.tanh(phase_diff_u) * amp_ratio_u
 
-        z_right = u_right + 1j * v_right
         phase_diff_v = torch.angle(z_right) - torch.angle(z_curr)
-        amp_ratio_v = torch.abs(z_right) / (torch.abs(z_curr) + EPS)
+        amp_ratio_v  = torch.abs(z_right) / (torch.abs(z_curr) + EPS)
         mod_v = torch.tanh(phase_diff_v) * amp_ratio_v
 
-        # Interference terms
         interf_u = COUPLING * mod_u * z_left
         interf_v = COUPLING * mod_v * z_right
 
-        # Residual + interference
         u_new = u[-1] + interf_u
         v_new = v[-1] + interf_v
 
-        # Nonlinearity (tanh on real & imag parts)
+        # Nonlinearity
         u_new = torch.tanh(u_new.real) + 1j * torch.tanh(u_new.imag)
         v_new = torch.tanh(v_new.real) + 1j * torch.tanh(v_new.imag)
 
-        # Intensity normalization (max |z|^2 = 1)
+        # Normalize max intensity = 1
         z = u_new + 1j * v_new
         max_int = torch.max(torch.abs(z)**2)
         if max_int > 0:
             scale = 1.0 / torch.sqrt(max_int)
-            u_new = u_new * scale
-            v_new = v_new * scale
+            u_new *= scale
+            v_new *= scale
 
         u.append(u_new)
         v.append(v_new)
 
-    if return_all:
-        return u, v
-    return u[-1], v[-1]
+    return u[-1] + 1j * v[-1]
 
 # ────────────────────────────────────────────────────────────────
-#  Reverse optimization demo
+#  Reverse optimization with readout head
 # ────────────────────────────────────────────────────────────────
-def reverse_optimize(target_text: str, lr=0.05, steps=800):
-    target_z = text_to_complex(target_text)
+def reverse_optimize_with_readout(target_text: str, lr=0.08, steps=1800):
+    target_indices = text_to_indices(target_text)
+    target_onehot = F.one_hot(target_indices, num_classes=VOCAB_SIZE).float()
 
-    # Learnable initial state (what we optimize)
-    initial_z = text_to_complex(" " * N) + 0.1 * torch.randn(N, device=device, dtype=torch.complex64)
+    # Learnable initial complex embedding
+    initial_z = 0.3 * torch.randn(N, device=device, dtype=torch.complex64)
     initial_z.requires_grad_(True)
 
-    optimizer = torch.optim.Adam([initial_z], lr=lr)
+    optimizer = torch.optim.Adam([initial_z, *readout.parameters()], lr=lr)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=600, gamma=0.4)
 
     losses = []
 
     for it in range(steps):
         optimizer.zero_grad()
 
-        u0 = initial_z.real
-        v0 = initial_z.imag
+        z_final = evolve(initial_z.real, initial_z.imag)
+        logits = readout(z_final)               # [N, VOCAB_SIZE]
 
-        u_final, v_final = evolve(u0, v0)
-        pred_z = u_final + 1j * v_final
-
-        # loss = F.mse_loss(pred_z, target_z)
-        # Fix: MSE for complex numbers manually
-        loss = torch.mean(torch.abs(pred_z - target_z)**2)
+        loss = F.cross_entropy(logits, target_indices, reduction='mean')
         loss.backward()
         optimizer.step()
+        scheduler.step()
 
         losses.append(loss.item())
 
-        if it % 100 == 0:
-            print(f"Step {it:4d} | Loss: {loss.item():.6f}")
+        if it % 200 == 0:
+            print(f"Step {it:4d} | CE loss: {loss.item():.4f} | lr: {optimizer.param_groups[0]['lr']:.5f}")
 
-    # Final results
+    # Results
     with torch.no_grad():
-        u_final, v_final = evolve(initial_z.real, initial_z.imag)
-        pred_final = u_final + 1j * v_final
-        recovered_text = complex_to_text(pred_final)
-        initial_text = complex_to_text(initial_z)
+        z_final = evolve(initial_z.real, initial_z.imag)
+        logits = readout(z_final)
+        pred_probs = F.softmax(logits / 0.8, dim=-1)   # mild temperature
+        pred_indices = pred_probs.argmax(dim=-1)
+        recovered_text = indices_to_text(pred_indices)
+
+        initial_indices = ((torch.angle(initial_z) + torch.pi) / (2 * torch.pi) * VOCAB_SIZE).round().long().clamp(0, VOCAB_SIZE-1)
+        initial_text_guess = indices_to_text(initial_indices)
 
     return {
-        "target": target_text,
-        "recovered_after_evolution": recovered_text,
-        "optimized_initial_text": initial_text,
+        "target_text": target_text,
+        "recovered_text": recovered_text,
+        "initial_text_guess": initial_text_guess,
         "final_loss": losses[-1],
-        "loss_history": losses
+        "loss_trend": losses[::100]  # every 100 steps
     }
 
 # ────────────────────────────────────────────────────────────────
-#  Run demo
+#  Demo run
 # ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    target = "hello world this is a test   "[:N]
-    print("Target (desired after evolution):", repr(target))
+    target = "the quick brown fox jumps over the lazy dog  "[:N]
+    print("Target (next-token shifted sequence):")
+    print("  " + repr(target))
 
-    result = reverse_optimize(target, lr=0.08, steps=1200)
+    result = reverse_optimize_with_readout(target)
 
-    print("\nResults:")
-    print("  Target:                  ", repr(result["target"]))
-    print("  Recovered after evolution:", repr(result["recovered_after_evolution"]))
-    print("  Optimized initial text:  ", repr(result["optimized_initial_text"]))
-    print(f"  Final MSE loss: {result['final_loss']:.6f}")
+    print("\nFinal Results after optimization:")
+    print(f"  Target:     {repr(result['target_text'])}")
+    print(f"  Recovered:  {repr(result['recovered_text'])}")
+    print(f"  Initial guess: {repr(result['initial_text_guess'])}")
+    print(f"  Final CE loss: {result['final_loss']:.4f}")
+    print("  Loss trend (every 100 steps):", [f"{l:.4f}" for l in result['loss_trend']])
