@@ -1,6 +1,6 @@
 # LLM Lightwave: Complex-Valued Neural Architecture
 
-I have successfully debugged and optimized the [llm_light.py](file:///c:/Users/andre/OneDrive/Documentos/dev/LLM_lightwave/llm_light.py) script. The model is now training on the TinyStories dataset. Below is an overview of the technology behind this model and the benefits it offers.
+The model is now training on the TinyStories dataset. Below is an overview of the technology behind this model and the benefits it offers.
 
 ## Core Technology: Complex-Valued Neural Networks (CVNNs)
 
@@ -30,3 +30,11 @@ The model is designed as a **Dynamical System**. Each token acts as an impulse t
 | **Phase-Awareness** | Complex numbers naturally represent periodic and structural patterns in language (like grammar and rhythm) more efficiently through phase-shifting. |
 | **Constant-Time Inference** | Because it evolves the state incrementally, generating the next token is extremely fast and doesn't require re-processing the entire sequence history like some traditional models. |
 | **Memory Efficiency** | The `z_cache` approach stores historical context as a compressed complex state rather than a growing set of KD/V vectors. |
+
+## Command Line Interface
+
+Command Line Interface: You can now run the script with specific flags:
+python llm_light.py --train : Start training from scratch.
+python llm_light.py --train --load : Resume training from model.pth.
+python llm_light.py --generate --load : Generate text using a saved model.
+python llm_light.py --prompt "Your text here" --load : Generate with a custom prompt.

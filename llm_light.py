@@ -7,6 +7,7 @@ from tqdm import tqdm
 import random
 import os
 import tiktoken 
+import argparse
 
 # ────────────────────────────────────────────────────────────────
 #  Hyperparameters
@@ -14,7 +15,7 @@ import tiktoken
 MAX_N = 512
 M = 8                # evolution steps per token
 H = 4
-COUPLING = 0.12
+COUPLING = 0.99
 EPS = 1e-8
 SEQ_LEN = 128
 BATCH_SIZE = 8
@@ -174,7 +175,7 @@ def incremental_evolve_step(candidate, z_cache, i):
     # Evolution: Modulate based on interaction with past
     mod = modulator(i, candidate, past)
     
-    return candidate + mod
+    return candidate + COUPLING * mod
 
 # ────────────────────────────────────────────────────────────────
 #  Forward pass (teacher forcing) - adapted for subword tokens
@@ -197,6 +198,35 @@ def forward_incremental(token_ids: torch.Tensor):
         z_cache.append(z_new)
 
     return torch.stack(logits_list)  # [seq_len-1, VOCAB_SIZE]
+
+# ────────────────────────────────────────────────────────────────
+#  Check-pointing
+# ────────────────────────────────────────────────────────────────
+def save_checkpoint(path="model.pth"):
+    checkpoint = {
+        'token_embed': token_embed.state_dict(),
+        'pos_bias': pos_bias.state_dict(),
+        'modulator': modulator.state_dict(),
+        'readout': readout.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'scheduler': scheduler.state_dict()
+    }
+    torch.save(checkpoint, path)
+    print(f"Checkpoint saved to {path}")
+
+def load_checkpoint(path="model.pth"):
+    if not os.path.exists(path):
+        print(f"No checkpoint found at {path}")
+        return False
+    checkpoint = torch.load(path, map_location=DEVICE)
+    token_embed.load_state_dict(checkpoint['token_embed'])
+    pos_bias.load_state_dict(checkpoint['pos_bias'])
+    modulator.load_state_dict(checkpoint['modulator'])
+    readout.load_state_dict(checkpoint['readout'])
+    optimizer.load_state_dict(checkpoint['optimizer'])
+    scheduler.load_state_dict(checkpoint['scheduler'])
+    print(f"Checkpoint loaded from {path}")
+    return True
 
 # ────────────────────────────────────────────────────────────────
 #  Training loop (same structure, real chunks)
@@ -229,6 +259,7 @@ def train():
         scheduler.step()
 
         print(f"Epoch {epoch+1:2d}  Avg loss: {total_loss/steps:.4f}  LR: {scheduler.get_last_lr()[0]:.6f}")
+        save_checkpoint()
 
     print("Training finished.")
 
@@ -276,10 +307,21 @@ def generate(prompt: str, max_new=180, temperature=0.92):
 #  Run
 # ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    train()
+    parser = argparse.ArgumentParser(description="LLM Lightwave: Complex-Valued LLM")
+    parser.add_argument("--train", action="store_true", help="Start training")
+    parser.add_argument("--generate", action="store_true", help="Generate text")
+    parser.add_argument("--load", action="store_true", help="Load checkpoint before running")
+    parser.add_argument("--prompt", type=str, default="Once upon a time there was a little girl who loved to", help="Prompt for generation")
+    args = parser.parse_args()
 
-    print("\n" + "="*90)
-    test_prompt = "Once upon a time there was a little girl who loved to"
-    print(f"Test prompt: {test_prompt!r}")
-    generated = generate(test_prompt)
-    print(f"Generated continuation:\n{generated}")
+    if args.load:
+        load_checkpoint()
+
+    if args.train:
+        train()
+
+    if args.generate or not args.train:
+        print("\n" + "="*90)
+        print(f"Test prompt: {args.prompt!r}")
+        generated = generate(args.prompt)
+        print(f"Generated continuation:\n{generated}")
