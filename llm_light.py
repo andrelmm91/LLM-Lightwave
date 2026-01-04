@@ -1,4 +1,5 @@
 import numpy as np
+from scipy.linalg import lstsq
 
 # Parameters
 N = 100000  # Scalable to 100k
@@ -15,13 +16,31 @@ v[0, :] = initial_z.imag
 
 # Evolve vectorized
 for m in range(M):
-    u_rolled = np.roll(u[m, :], 1)   # For x-1: roll brings x-1 to x
-    v_rolled = np.roll(v[m, :], 1)
-    u[m+1, :] = 1/np.sqrt(2) * (u_rolled + 1j * v_rolled)
+    # [Shifts with absorbing boundaries]
     
-    v_rolled_right = np.roll(v[m, :], -1)  # For x+1: roll -1 brings x+1 to x
-    u_rolled_right = np.roll(u[m, :], -1)
-    v[m+1, :] = 1/np.sqrt(2) * (v_rolled_right + 1j * u_rolled_right)
+    # Phase/amplitude modulation
+    phase_diff_u = np.angle(u_left + 1j * v_left) - np.angle(u[m] + 1j * v[m])
+    amp_ratio_u = np.abs(u_left + 1j * v_left) / (np.abs(u[m] + 1j * v[m]) + 1e-8)
+    mod_factor_u = np.tanh(phase_diff_u) * amp_ratio_u
+    
+    # [Similar for v]
+    
+    # Updates
+    interference_u = 0.1 * mod_factor_u * (u_left + 1j * v_left)
+    u[m+1, :] = u[m, :] + interference_u
+    # [Similar for v]
+    
+    # Nonlinearity
+    u[m+1, :] = np.tanh(u[m+1, :].real) + 1j * np.tanh(u[m+1, :].imag)
+    # [For v]
+    
+    # Normalization
+    z = u[m+1, :] + 1j * v[m+1, :]
+    max_int = np.max(np.abs(z)**2)
+    if max_int > 0:
+        scale = 1.0 / np.sqrt(max_int)
+        u[m+1, :] *= scale
+        v[m+1, :] *= scale
 
 # Final
 final_z = u[M, :] + 1j * v[M, :]
