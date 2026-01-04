@@ -1,6 +1,5 @@
 import torch
 import torch.nn.functional as F
-import numpy as np
 
 # ────────────────────────────────────────────────────────────────
 #  Hyperparameters
@@ -43,9 +42,9 @@ class MultiHeadModulator(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.heads = torch.nn.ModuleList([
-            torch.nn.Linear(2, 2) for _ in range(H)
+            torch.nn.Linear(4, 2) for _ in range(H)
         ])
-        self.out_proj = torch.nn.Linear(H*2, 2)
+        self.out_proj = torch.nn.Linear(H, 2)
 
     def forward(self, z_curr, z_past):
         if z_past.numel() == 0:
@@ -94,11 +93,16 @@ def incremental_evolve_step(new_z_candidate, z_cache, current_position: int):
     z_past = torch.stack(z_cache)
     curr = candidate_with_pos.unsqueeze(0)
 
+    # Prepare features for modulator (Real, Imag)
+    z_past_feat = torch.stack([z_past.real, z_past.imag], dim=-1)
+    curr_feat = torch.stack([curr.real, curr.imag], dim=-1)
+
     # Multi-head modulation
-    mod_factor = modulator(curr, z_past)  # [2] complex
+    mod_out = modulator(curr_feat, z_past_feat)  # [2] (real, imag) parts of modulation
+    mod_complex = torch.complex(mod_out[0], mod_out[1])
 
     # Simplified interference aggregation from cache
-    interf = COUPLING * mod_factor * z_past.mean()
+    interf = COUPLING * mod_complex * z_past.mean()
 
     z_new = candidate_with_pos + interf
 
