@@ -2,79 +2,110 @@ import torch
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
-
-
+import numpy as np
+from tqdm import tqdm
+import random
+import os
 
 # ────────────────────────────────────────────────────────────────
 #  Hyperparameters
 # ────────────────────────────────────────────────────────────────
-MAX_N = 256
-M = 8                # evolution steps per token
-H = 4                # multi-head count
+MAX_N = 512
+M = 32                # evolution steps per token
+H = 4
 COUPLING = 0.12
 EPS = 1e-8
-VOCAB_SIZE = 32
-READOUT_DIM = 32
+VOCAB_SIZE = 96      # increased for real text (basic ASCII + common chars)
+SEQ_LEN = 128
 BATCH_SIZE = 8
-SEQ_LEN = 64         # training sequence length
-EPOCHS = 100
-LR = 0.008
+EPOCHS = 25          # adjust according to your compute
+LR = 6e-4
+REL_MAX_DIST = 64    # for relative positional bias clipping
+DATA_PATH = "TinyStories-train.txt"  # ← download from HF!
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-print(f"Training on device: {DEVICE}")
+print(f"Using device: {DEVICE}")
 
 # ────────────────────────────────────────────────────────────────
-#  Vocabulary
+#  Load real TinyStories text
 # ────────────────────────────────────────────────────────────────
-vocab = list(" abcdefghijklmnopqrstuvwxyz012345")
-char_to_idx = {c: i for i, c in enumerate(vocab)}
-idx_to_char = {i: c for c, i in char_to_idx.items()}
+def load_tinystories(path=DATA_PATH):
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"TinyStories-train.txt not found!\n"
+            "Download from: https://huggingface.co/datasets/roneneldan/TinyStories\n"
+            "(use TinyStories-train.txt ~1-2GB)"
+        )
+    with open(path, 'r', encoding='utf-8') as f:
+        text = f.read()
+    print(f"Loaded TinyStories text: {len(text):,} characters")
+    return text
 
-def text_to_indices(text: str, seq_len: int = SEQ_LEN) -> torch.Tensor:
-    text = (text.lower() * (seq_len // len(text) + 2))[:seq_len]
-    return torch.tensor([char_to_idx.get(c, 0) for c in text], dtype=torch.long, device=DEVICE)
+full_text = load_tinystories()
 
-def indices_to_text(indices) -> str:
-    return "".join(idx_to_char.get(int(i), "?") for i in indices).rstrip()
+# Simple character-level tokenizer (good enough for toy)
+chars = sorted(list(set(full_text)))
+VOCAB_SIZE = len(chars)
+char_to_idx = {ch: i for i, ch in enumerate(chars)}
+idx_to_char = {i: ch for i, ch in enumerate(chars)}
+
+def get_random_chunk(length=SEQ_LEN):
+    start = random.randint(0, len(full_text) - length - 1)
+    chunk = full_text[start:start + length]
+    return torch.tensor([char_to_idx[c] for c in chunk], dtype=torch.long, device=DEVICE)
 
 # ────────────────────────────────────────────────────────────────
 #  Modules
 # ────────────────────────────────────────────────────────────────
-class LearnedPositionalEncoding(torch.nn.Module):
-    def __init__(self, max_len=MAX_N):
+class RelativePositionalBias(torch.nn.Module):
+    """Trainable relative positional bias (complex-valued)"""
+    def __init__(self, max_rel_dist=REL_MAX_DIST):
         super().__init__()
-        self.pe = torch.nn.Parameter(0.25 * torch.randn(max_len, dtype=torch.complex64, device=DEVICE))
+        # Bias for relative distances -2*max ... +2*max
+        size = 2 * max_rel_dist + 1
+        self.bias = torch.nn.Parameter(torch.randn(size, dtype=torch.complex64) * 0.02)
 
-    def forward(self, pos: torch.Tensor):
-        return self.pe[pos % MAX_N]
+    def get_bias(self, rel_dist):
+        # rel_dist can be tensor of shape [...]
+        idx = rel_dist + REL_MAX_DIST
+        idx = torch.clamp(idx, 0, len(self.bias) - 1)
+        return self.bias[idx]
 
 class MultiHeadModulator(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.heads = torch.nn.ModuleList([torch.nn.Linear(4, 2) for _ in range(H)])
         self.out_proj = torch.nn.Linear(H*2, 2)
+        self.rel_bias = RelativePositionalBias()
 
-    def forward(self, z_curr, z_past):
+    def forward(self, curr_pos: int, z_curr, z_past):
         if z_past.numel() == 0:
             return torch.zeros(2, device=DEVICE, dtype=torch.float32)
-        
-        # Prepare features: concatenate current and past (Real, Imag)
-        # z_curr: [1, 2] (real, imag)
-        # z_past: [k, 2] (real, imag)
-        # Check inputs: if they are complex, split them. If they are already split (dim=-1=2), use as is.
-        # The caller (see below) might pass complex tensor or split tensor?
-        # User code passed: `modulator(candidate.unsqueeze(0), z_past)` where they are complex.
-        # So we MUST split them here.
-        
+
+        past_len = z_past.size(0)
+        rel_dists = torch.arange(curr_pos - past_len, curr_pos, device=DEVICE)  # [past_len]
+        rel_biases = self.rel_bias.get_bias(rel_dists)  # [past_len] complex
+
+        # Features: (Real, Imag) for both curr and past
         z_curr_feat = torch.stack([z_curr.real, z_curr.imag], dim=-1) # [1, 2]
-        z_past_feat = torch.stack([z_past.real, z_past.imag], dim=-1) # [k, 2]
+        z_past_feat = torch.stack([z_past.real, z_past.imag], dim=-1) # [past_len, 2]
         
-        features = torch.cat([z_curr_feat.repeat(z_past.size(0), 1), z_past_feat], dim=-1) # [k, 4]
+        # Expand curr to match past
+        features = torch.cat([z_curr_feat.repeat(past_len, 1), z_past_feat], dim=-1) # [past_len, 4]
         
-        head_outs = [torch.tanh(head(features)) for head in self.heads] # List of [k, 2]
-        combined = torch.cat(head_outs, dim=-1) # [k, H*2]
+        head_outs = [torch.tanh(head(features)) for head in self.heads] # List of [past_len, 2]
+        combined = torch.cat(head_outs, dim=-1).mean(dim=0, keepdim=True) # [1, H*2] (Mean over past_len)
+
+        mod_out = self.out_proj(combined).squeeze() # [2] (Real, Imag vector)
         
-        return self.out_proj(combined.mean(dim=0, keepdim=True)).squeeze()
+        # Combine mod_out (float vector) with rel_biases (complex tensor)
+        # Convert mod_out to complex scalar
+        mod_complex = torch.complex(mod_out[0], mod_out[1])
+        
+        # Add average relative bias (simple aggregation)
+        final_mod = mod_complex + rel_biases.mean()
+        
+        return final_mod
 
 class ReadoutHead(torch.nn.Module):
     def __init__(self):
@@ -85,130 +116,101 @@ class ReadoutHead(torch.nn.Module):
         features = torch.stack([z.real, z.imag], dim=-1)
         return self.proj(features)
 
-# ────────────────────────────────────────────────────────────────
-#  Core components
-# ────────────────────────────────────────────────────────────────
-pos_enc = LearnedPositionalEncoding().to(DEVICE)
+# Instantiate
 modulator = MultiHeadModulator().to(DEVICE)
 readout = ReadoutHead().to(DEVICE)
 
 optimizer = optim.Adam(
-    list(pos_enc.parameters()) + list(modulator.parameters()) + list(readout.parameters()),
+    list(modulator.parameters()) + list(readout.parameters()),
     lr=LR, betas=(0.9, 0.98), weight_decay=1e-5
 )
-scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=LR*0.1)
+scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=LR*0.05)
 
 # ────────────────────────────────────────────────────────────────
-#  Incremental forward pass (teacher forcing)
+#  Forward pass (teacher forcing, incremental)
 # ────────────────────────────────────────────────────────────────
 def forward_incremental(indices: torch.Tensor):
-    """
-    Teacher-forcing forward pass
-    Returns logits for each position (except first)
-    """
     seq_len = indices.size(0)
     z_cache = []
     logits_list = []
 
     for i in range(seq_len):
-        # Target token at position i is used as teacher
         target_idx = indices[i]
-        candidate = 0.4 * torch.randn((), device=DEVICE, dtype=torch.complex64)
+        candidate = 0.35 * torch.randn((), device=DEVICE, dtype=torch.complex64)
 
-        # Add positional encoding
-        pe = pos_enc(torch.tensor(i, device=DEVICE))
-        candidate = candidate + pe              # Out-of-place add to make autograd happy
+        z_new = incremental_evolve_step(candidate, z_cache, i)
 
-        # Evolve
-        if z_cache:
-            z_past = torch.stack(z_cache)
-            mod_factor_tuple = modulator(candidate.unsqueeze(0), z_past) # [2] (real, imag)
-            mod_factor = torch.complex(mod_factor_tuple[0], mod_factor_tuple[1])
-            interf = COUPLING * mod_factor * z_past.mean()
-            z_new = candidate + interf
-        else:
-            z_new = candidate
-
-        # Nonlinearity + norm
-        z_new = torch.tanh(z_new.real) + 1j * torch.tanh(z_new.imag)
-        max_int = torch.max(torch.abs(z_new)**2)
-        if max_int > 0:
-            z_new = z_new * (1.0 / torch.sqrt(max_int))
-
-        # Collect logits (predict NEXT token)
         if i < seq_len - 1:
             logits = readout(z_new)
             logits_list.append(logits)
 
         z_cache.append(z_new)
 
-    return torch.stack(logits_list)  # [seq_len-1, VOCAB_SIZE]
+    return torch.stack(logits_list)
+
+# Reuse incremental_evolve_step from previous version (adapted)
+def incremental_evolve_step(candidate, z_cache, pos):
+    if z_cache:
+        z_past = torch.stack(z_cache)
+        # Modulator now returns a complex scalar
+        mod_factor = modulator(pos, candidate.unsqueeze(0), z_past)
+        interf = COUPLING * mod_factor * z_past.mean()
+        z_new = candidate + interf
+    else:
+        z_new = candidate
+
+    z_new = torch.tanh(z_new.real) + 1j * torch.tanh(z_new.imag)
+    max_int = torch.max(torch.abs(z_new)**2)
+    if max_int > 0:
+        z_new = z_new * (1.0 / torch.sqrt(max_int))
+    return z_new
 
 # ────────────────────────────────────────────────────────────────
 #  Training Loop
 # ────────────────────────────────────────────────────────────────
 def train():
-    simple_text = (
-        "once upon a time in a land far far away there lived a brave little mouse "
-        "who loved to explore the big wide world and meet new friends under the shining sun "
-        "and bright stars every night "
-    )
-
-    print("Starting training...")
-
+    print("Starting training on TinyStories...")
     for epoch in range(EPOCHS):
         total_loss = 0.0
         optimizer.zero_grad()
 
-        # Create batch-like data (repetition + shift for teacher forcing)
-        indices = text_to_indices(simple_text, SEQ_LEN * BATCH_SIZE)
-        indices = indices.view(BATCH_SIZE, SEQ_LEN)
-
-        for b in range(BATCH_SIZE):
-            seq = indices[b]
-            logits = forward_incremental(seq)          # [seq_len-1, VOCAB]
-            target = seq[1:]                           # next tokens
+        for _ in tqdm(range(BATCH_SIZE * 4), desc=f"Epoch {epoch+1}/{EPOCHS}"):  # many steps per epoch
+            seq = get_random_chunk(SEQ_LEN)
+            logits = forward_incremental(seq)  # [seq_len-1, VOCAB_SIZE]
+            target = seq[1:]
 
             loss = F.cross_entropy(logits, target, reduction='mean')
-            loss.backward(retain_graph=(b < BATCH_SIZE-1))  # accumulate gradients
+            loss.backward()
             total_loss += loss.item()
 
+        torch.nn.utils.clip_grad_norm_(list(modulator.parameters()) + list(readout.parameters()), 1.0)
         optimizer.step()
         scheduler.step()
 
-        avg_loss = total_loss / BATCH_SIZE
-        print(f"Epoch [{epoch+1}/{EPOCHS}]  Loss: {avg_loss:.4f}  LR: {scheduler.get_last_lr()[0]:.6f}")
+        print(f"Epoch [{epoch+1}/{EPOCHS}]  Avg loss: {total_loss/(BATCH_SIZE*4):.4f}  LR: {scheduler.get_last_lr()[0]:.6f}")
 
     print("Training finished.")
 
 # ────────────────────────────────────────────────────────────────
-#  Generation after training (greedy)
+#  Generation (same as before, greedy)
 # ────────────────────────────────────────────────────────────────
 @torch.no_grad()
-def generate(prompt: str, max_new=120, temperature=0.85):
-    prompt_idx = torch.tensor([char_to_idx.get(c.lower(), 0) for c in prompt], device=DEVICE)
+def generate(prompt: str, max_new=120, temperature=0.9):
+    prompt_idx = torch.tensor([char_to_idx.get(c, 0) for c in prompt.lower()], device=DEVICE)
     z_cache = []
     generated = prompt_idx.clone()
 
     # Prefill
     for i in range(len(prompt_idx)):
-        candidate = 0.4 * torch.randn((), device=DEVICE, dtype=torch.complex64)
-        pe = pos_enc(torch.tensor(i, device=DEVICE))
-        pe = pos_enc(torch.tensor(i, device=DEVICE))
-        candidate = candidate + pe
-
-        z_new = incremental_evolve_step(candidate, z_cache, i)  # reuse helper from previous
-        z_cache.append(z_new)
+        candidate = 0.35 * torch.randn((), device=DEVICE, dtype=torch.complex64)
+        z = incremental_evolve_step(candidate, z_cache, i)
+        z_cache.append(z)
 
     # Generate
     current_pos = len(prompt_idx)
     for _ in range(max_new):
         prev = z_cache[-1]
-        candidate = prev + 0.18 * torch.randn_like(prev)
-        pe = pos_enc(torch.tensor(current_pos, device=DEVICE))
-        pe = pos_enc(torch.tensor(current_pos, device=DEVICE))
-        candidate = candidate + pe
-
+        candidate = prev + 0.15 * torch.randn_like(prev)
         z_new = incremental_evolve_step(candidate, z_cache, current_pos)
 
         logits = readout(z_new) / temperature
@@ -218,41 +220,19 @@ def generate(prompt: str, max_new=120, temperature=0.85):
         z_cache.append(z_new)
         current_pos += 1
 
-        if next_token.item() == char_to_idx[' ']:
+        if next_token.item() == char_to_idx.get(' ', 0):
             break
 
-    return indices_to_text(generated)
-
-# Helper (from previous versions - for generation)
-def incremental_evolve_step(candidate, z_cache, pos):
-    pe = pos_enc(torch.tensor(pos, device=DEVICE))
-    pe = pos_enc(torch.tensor(pos, device=DEVICE))
-    candidate = candidate + pe
-
-    if not z_cache:
-        z_new = torch.tanh(candidate.real) + 1j * torch.tanh(candidate.imag)
-    else:
-        z_past = torch.stack(z_cache)
-        mod_factor_tuple = modulator(candidate.unsqueeze(0), z_past)
-        mod_factor = torch.complex(mod_factor_tuple[0], mod_factor_tuple[1])
-        interf = COUPLING * mod_factor * z_past.mean()
-        z_new = candidate + interf
-        z_new = torch.tanh(z_new.real) + 1j * torch.tanh(z_new.imag)
-
-    max_int = torch.max(torch.abs(z_new)**2)
-    if max_int > 0:
-        z_new *= 1.0 / torch.sqrt(max_int)
-
-    return z_new
+    return "".join(idx_to_char.get(i.item(), "?") for i in generated)
 
 # ────────────────────────────────────────────────────────────────
-#  Run everything
+#  Run
 # ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     train()
 
-    print("\n" + "="*70)
-    prompt = "once upon a time"
+    print("\n" + "="*80)
+    prompt = "Once upon a time there was a little"
     print(f"Prompt: {repr(prompt)}")
     generated = generate(prompt)
     print(f"Generated: {repr(generated)}")
