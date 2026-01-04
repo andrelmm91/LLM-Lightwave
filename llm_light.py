@@ -81,9 +81,12 @@ class RelativePositionalBias(torch.nn.Module):
         size = 2 * max_rel_dist + 1
         self.bias = torch.nn.Parameter(torch.randn(size, dtype=torch.complex64) * 0.02)
 
-    def get_bias(self, rel_dist):
+    def forward(self, rel_dist):
         idx = rel_dist + REL_MAX_DIST
-        idx = torch.clamp(idx, 0, len(self.bias) - 1)
+        if torch.is_tensor(idx):
+            idx = torch.clamp(idx, 0, len(self.bias) - 1)
+        else:
+            idx = max(0, min(idx, len(self.bias) - 1))
         return self.bias[idx]
 
 class MultiHeadModulator(torch.nn.Module):
@@ -132,7 +135,7 @@ class MultiHeadModulator(torch.nn.Module):
         
         # Bias
         rel_dists = torch.arange(curr_pos - past_len, curr_pos, device=DEVICE)
-        biases = self.rel_bias.get_bias(rel_dists) # [N]
+        biases = self.rel_bias(rel_dists) # [N]
         # Expand biases to [dim]? It is scalar complex.
         # Broadcasting handles it.
         
@@ -164,133 +167,117 @@ class QuantumWaveModulator(torch.nn.Module):
     def forward(self, curr_pos, z_curr, z_past):
         if z_past.numel() == 0:
             return torch.zeros_like(z_curr)
-            
-        # Implementation of the shift + coin interference logic.
-        # Let's take u from history and v from current stimuli
         u_prev = z_past[-1, 0]
         v_curr = z_curr[1]
-        
-        # Apply Coin with coupling
         state = torch.stack([u_prev, v_curr])
-        # User: "multiply the coupling in the coin vector"
         out = (self.coin * COUPLING) @ state
-        
         return out
 
-# Instantiate
-token_embed = TokenEmbedding(VOCAB_SIZE).to(DEVICE)
-pos_bias = RelativePositionalBias().to(DEVICE)
-modulator_neural = MultiHeadModulator().to(DEVICE)
-modulator_wave = QuantumWaveModulator().to(DEVICE)
-readout = ReadoutHead().to(DEVICE)
+class PhotonicInterferenceLayer(torch.nn.Module):
+    """One full interference layer/block"""
+    def __init__(self, mode="neural"):
+        super().__init__()
+        self.mode = mode
+        if mode == "neural":
+            self.modulator = MultiHeadModulator()
+        else:
+            self.modulator = QuantumWaveModulator()
+        self.norm_scale = torch.nn.Parameter(torch.tensor(1.0))
 
-# Will be set by CLI
-current_mode = "neural" 
+    def forward(self, candidate, z_cache, pos):
+        if not z_cache:
+            z_new = candidate
+        else:
+            z_past = torch.stack(z_cache)
+            mod_factor = self.modulator(pos, candidate, z_past)
+            if self.mode == "wave":
+                z_new = mod_factor + (1 - COUPLING) * candidate
+            else:
+                z_new = candidate + COUPLING * mod_factor
 
-def get_params():
-    params = list(token_embed.parameters()) + list(pos_bias.parameters()) + list(readout.parameters())
-    if current_mode == "neural":
-        params += list(modulator_neural.parameters())
-    return params
+        # Photonic-style non-linearity and normalization
+        z_new = torch.tanh(z_new.real) + 1j * torch.tanh(z_new.imag)
+        max_int = torch.max(torch.abs(z_new)**2)
+        if max_int > 0:
+            z_new = z_new * (self.norm_scale / torch.sqrt(max_int + EPS))
+        return z_new
 
-optimizer = optim.Adam(get_params(), lr=LR)
-scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=LR*0.05)
+class MultiLayerPhotonicNN(torch.nn.Module):
+    def __init__(self, mode="neural", num_layers=4):
+        super().__init__()
+        self.mode = mode
+        self.token_embed = TokenEmbedding(VOCAB_SIZE)
+        self.pos_bias = RelativePositionalBias()
+        self.layers = torch.nn.ModuleList([PhotonicInterferenceLayer(mode=mode) for _ in range(num_layers)])
+        self.readout = ReadoutHead()
 
-# ────────────────────────────────────────────────────────────────
-#  Evolution Step
-# ────────────────────────────────────────────────────────────────
-def incremental_evolve_step(candidate, z_cache, i):
-    # Retrieve previous state
-    if not z_cache:
-        past = torch.empty(0, 2, device=DEVICE, dtype=torch.complex64)
-    else:
-        past = torch.stack(z_cache) # [N, dim]
+    def forward_incremental(self, token_ids):
+        seq_len = token_ids.size(0)
+        z_cache = []
+        logits_list = []
 
-    if current_mode == "wave":
-        mod = modulator_wave(i, candidate, past)
-        # In wave mode, the interference IS the next state
-        # We add a residual from candidate for the non-coupled part
-        return mod + (1 - COUPLING) * candidate
-    else:
-        mod = modulator_neural(i, candidate, past)
-        return candidate + COUPLING * mod
+        for i in range(seq_len):
+            z_current = self.token_embed(token_ids[i:i+1]).squeeze(0)
+            # Add relative positional bias
+            z_current = z_current + self.pos_bias(i)
+            
+            for layer in self.layers:
+                z_current = layer(z_current, z_cache, i)
+            if i < seq_len - 1:
+                logits_list.append(self.readout(z_current))
+            z_cache.append(z_current)
+        return torch.stack(logits_list)
 
-# ────────────────────────────────────────────────────────────────
-#  Forward pass (teacher forcing) - adapted for subword tokens
-# ────────────────────────────────────────────────────────────────
-def forward_incremental(token_ids: torch.Tensor):
-    seq_len = token_ids.size(0)
-    z_cache = []
-    logits_list = []
+# Model placeholder
+model = None
+optimizer = None
+scheduler = None
+current_mode = "neural" # default
 
-    for i in range(seq_len):
-        # Embed current token
-        candidate = token_embed(token_ids[i:i+1]).squeeze(0)
+def init_model(mode="neural", num_layers=4):
+    global model, optimizer, scheduler, current_mode
+    current_mode = mode
+    model = MultiLayerPhotonicNN(mode=mode, num_layers=num_layers).to(DEVICE)
+    optimizer = optim.Adam(model.parameters(), lr=LR)
+    scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=LR*0.05)
 
-        z_new = incremental_evolve_step(candidate, z_cache, i)  # from previous version
-
-        if i < seq_len - 1:
-            logits = readout(z_new)
-            logits_list.append(logits)
-
-        z_cache.append(z_new)
-
-    return torch.stack(logits_list)  # [seq_len-1, VOCAB_SIZE]
-
-# ────────────────────────────────────────────────────────────────
-#  Check-pointing
-# ────────────────────────────────────────────────────────────────
 def save_checkpoint(path=None):
     checkpoint = {
-        'token_embed': token_embed.state_dict(),
-        'pos_bias': pos_bias.state_dict(),
-        'modulator_neural': modulator_neural.state_dict(),
-        'readout': readout.state_dict(),
-        'optimizer': optimizer.state_dict(),
-        'scheduler': scheduler.state_dict(),
-        'mode': current_mode
+        'model_state': model.state_dict(),
+        'optimizer_state': optimizer.state_dict(),
+        'scheduler_state': scheduler.state_dict(),
+        'mode': current_mode,
+        'num_layers': len(model.layers)
     }
     
-    # Standard latest file
     torch.save(checkpoint, "model.pth")
-    
-    # Timestamped specific file
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     dynamic_path = f"model_{current_mode}_{timestamp}.pth"
     torch.save(checkpoint, dynamic_path)
-    
     print(f"Checkpoints saved: model.pth and {dynamic_path}")
 
 def load_checkpoint(path="model.pth"):
-    global current_mode, optimizer, scheduler
+    global current_mode, optimizer, scheduler, model
     if not os.path.exists(path):
         print(f"No checkpoint found at {path}")
         return False
     
-    # We use weights_only=False because the checkpoint contains optimizer/scheduler states
     checkpoint = torch.load(path, map_location=DEVICE, weights_only=False)
     
     saved_mode = checkpoint.get('mode', 'neural')
-    if saved_mode != current_mode:
-        print(f"Checkpoint mode ({saved_mode}) differs from current mode ({current_mode}). Switching...")
-        current_mode = saved_mode
-        # Re-initialize optimizer and scheduler with the correct parameters for this mode
-        optimizer = optim.Adam(get_params(), lr=LR)
-        scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=LR*0.05)
-        
-    token_embed.load_state_dict(checkpoint['token_embed'])
-    pos_bias.load_state_dict(checkpoint['pos_bias'])
-    if 'modulator_neural' in checkpoint and saved_mode == 'neural':
-        modulator_neural.load_state_dict(checkpoint['modulator_neural'])
-    readout.load_state_dict(checkpoint['readout'])
-    
-    try:
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        scheduler.load_state_dict(checkpoint['scheduler'])
-    except ValueError as e:
-        print(f"Warning: Could not load optimizer state due to mismatch ({e}). Using freshly initialized optimizer.")
+    saved_layers = checkpoint.get('num_layers', 4)
 
-    print(f"Checkpoint loaded from {path} (Mode: {saved_mode})")
+    # Re-initialize model to match saved architecture if necessary
+    if saved_mode != current_mode or len(model.layers) != saved_layers:
+        print(f"Switching to mode {saved_mode} with {saved_layers} layers...")
+        current_mode = saved_mode
+        init_model(mode=saved_mode, num_layers=saved_layers)
+
+    model.load_state_dict(checkpoint['model_state'])
+    optimizer.load_state_dict(checkpoint['optimizer_state'])
+    scheduler.load_state_dict(checkpoint['scheduler_state'])
+    
+    print(f"Checkpoint loaded: {path} (Mode: {saved_mode}, Layers: {saved_layers})")
     return True
 
 # ────────────────────────────────────────────────────────────────
@@ -305,7 +292,7 @@ def train():
         with tqdm(total=STEPS_PER_EPOCH, desc=f"Epoch {epoch+1}/{EPOCHS}") as pbar:
             while steps < STEPS_PER_EPOCH:
                 seq = get_random_chunk(SEQ_LEN)
-                logits = forward_incremental(seq)
+                logits = model.forward_incremental(seq)
                 target = seq[1:]
 
                 loss = F.cross_entropy(logits, target, ignore_index=tokenizer.eot_token)
@@ -315,7 +302,7 @@ def train():
                 pbar.update(1)
                 pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-        torch.nn.utils.clip_grad_norm_(get_params(), 1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         optimizer.zero_grad()
         scheduler.step()
@@ -333,34 +320,38 @@ def generate(prompt: str, max_new=180, temperature=0.92):
     prompt_tokens = torch.tensor(tokenizer.encode(prompt), device=DEVICE)
     z_cache = []
 
-    # Prefill
-    for i, tok_id in enumerate(prompt_tokens):
-        candidate = token_embed(tok_id.unsqueeze(0)).squeeze(0)
-        z = incremental_evolve_step(candidate, z_cache, i)
-        z_cache.append(z)
+    # Process prompt tokens
+    logits = None
+    for i in range(len(prompt_tokens)):
+        token_id = prompt_tokens[i:i+1]
+        z_curr = model.token_embed(token_id).squeeze(0)
+        z_curr = z_curr + model.pos_bias(i)
+        
+        for layer in model.layers:
+            z_curr = layer(z_curr, z_cache, i)
+        z_cache.append(z_curr)
+        logits = model.readout(z_curr)
 
     generated_tokens = prompt_tokens.clone()
-
     current_pos = len(prompt_tokens)
+
     for _ in range(max_new):
-        # The last state in cache predicts the next token
-        z_current = z_cache[-1]
-        logits = readout(z_current) / temperature
-        
-        # Sample next token
+        logits = logits / temperature
         probs = F.softmax(logits, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1) # [1]
+        next_token = torch.multinomial(probs, num_samples=1)
         
-        # Append to results
         generated_tokens = torch.cat([generated_tokens, next_token])
-        
         if next_token.item() == tokenizer.eot_token:
             break
 
-        # Feed back as next embedding
-        candidate = token_embed(next_token).squeeze(0)
-        z_next = incremental_evolve_step(candidate, z_cache, current_pos)
-        z_cache.append(z_next)
+        # Feed prediction back through the layers
+        z_curr = model.token_embed(next_token).squeeze(0)
+        z_curr = z_curr + model.pos_bias(current_pos)
+        
+        for layer in model.layers:
+            z_curr = layer(z_curr, z_cache, current_pos)
+        z_cache.append(z_curr)
+        logits = model.readout(z_curr)
         current_pos += 1
 
     return tokenizer.decode(generated_tokens.tolist())
@@ -375,8 +366,9 @@ if __name__ == "__main__":
     parser.add_argument("--load", action="store_true", help="Load checkpoint before running")
     parser.add_argument("--checkpoint", type=str, default="model.pth", help="Path to specific checkpoint file")
     parser.add_argument("--mode", type=str, choices=["neural", "wave"], default="neural", help="Modulator mode")
+    parser.add_argument("--layers", type=int, default=4, help="Number of layers")
     parser.add_argument("--epochs", type=int, default=EPOCHS, help="Number of training epochs")
-    parser.add_argument("--steps", type=int, default=200, help="Steps per epoch")
+    parser.add_argument("--steps", type=int, default=STEPS_PER_EPOCH, help="Steps per epoch")
     parser.add_argument("--prompt", type=str, default="Once upon a time there was a little girl who loved to", help="Prompt for generation")
     args = parser.parse_args()
 
@@ -384,9 +376,8 @@ if __name__ == "__main__":
     EPOCHS = args.epochs
     STEPS_PER_EPOCH = args.steps
     
-    # Re-init optimizer if we changed mode (to include/exclude neural modulator params)
-    optimizer = optim.Adam(get_params(), lr=LR)
-    scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=LR*0.05)
+    # Initialize the model correctly before potentially loading
+    init_model(mode=current_mode, num_layers=args.layers)
 
     if args.load:
         load_checkpoint(args.checkpoint)
