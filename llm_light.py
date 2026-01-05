@@ -21,22 +21,19 @@ def mish(x):
 # ────────────────────────────────────────────────────────────────
 #  Hyperparameters
 # ────────────────────────────────────────────────────────────────
-MAX_N = 512
-M = 8                # evolution steps per token
-H = 4
-COUPLING = 0.12
-EPS = 1e-8
-SEQ_LEN = 128
-BATCH_SIZE = 8
-EPOCHS = 15
-STEPS_PER_EPOCH = 200
-LR = 4e-4
-EMBED_DIM = 16          # Increased: 8 real + 8 imaginary (or 16 pairs)
-BEAM_WIDTH = 5          # for beam search
-REL_MAX_DIST = 64
-GRAD_CLIP = 1.0
-LAYERS_DEFAULT = 4
-VAL_STEPS = 100         # Number of validation chunks per epoch
+M = 8                # Internal evolution steps (temporal depth) per layer
+H = 4                # Number of parallel attention heads in the modulator
+INITIAL_COUPLING = 0.12      # Initial coupling strength between field and candidate
+SEQ_LEN = 128        # Context window length for training samples
+EPOCHS = 15          # Total training passes over the dataset
+STEPS_PER_EPOCH = 200 # number of weight updates per epoch
+LR = 4e-4            # Initial learning rate for Adam optimizer
+EMBED_DIM = 16       # Total dimension: 8 real + 8 imaginary pairs (for 16D CVNN)
+BEAM_WIDTH = 5       # Number of candidate beams maintained in beam search
+REL_MAX_DIST = 64    # Max relative distance for unique positional biases
+GRAD_CLIP = 1.0      # Maximum gradient norm to prevent explosions
+LAYERS_DEFAULT = 4   # Default number of cascaded interference stages
+VAL_STEPS = 100      # Number of validation chunks to sample each epoch
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
@@ -201,7 +198,7 @@ class QuantumWaveModulator(torch.nn.Module):
             [0.0 + 1.0j, 1.0 + 0.0j]
         ], dtype=torch.complex64) / (2.0**0.5))
 
-    def forward(self, curr_pos, z_curr, z_past, coupling=0.12):
+    def forward(self, curr_pos, z_curr, z_past, coupling=INITIAL_COUPLING):
         if z_past.numel() == 0:
             return torch.zeros_like(z_curr)
         u_prev = z_past[-1, 0]
@@ -219,26 +216,34 @@ class PhotonicInterferenceLayer(torch.nn.Module):
             self.modulator = MultiHeadModulator()
         else:
             self.modulator = QuantumWaveModulator()
-        self.coupling = torch.nn.Parameter(torch.tensor(0.12))
+        self.coupling = torch.nn.Parameter(torch.tensor(INITIAL_COUPLING))
         self.norm_scale = torch.nn.Parameter(torch.tensor(1.0))
 
-    def forward(self, candidate, z_cache, pos):
-        if not z_cache:
-            z_new = candidate
-        else:
-            z_past = torch.stack(z_cache)
-            if self.mode == "wave":
-                mod_factor = self.modulator(pos, candidate, z_past, coupling=self.coupling)
-                z_new = mod_factor + (1 - self.coupling) * candidate
+    def forward(self, candidate, z_cache, pos, num_steps=M):
+        z_new = candidate
+        
+        # Internal temporal evolution loop
+        for _ in range(num_steps):
+            if not z_cache:
+                # First token: no interference, just modulation? 
+                # Or we can skip loop. Let's keep it simple:
+                pass
             else:
-                mod_factor = self.modulator(pos, candidate, z_past)
-                z_new = candidate + self.coupling * mod_factor
+                z_past = torch.stack(z_cache)
+                if self.mode == "wave":
+                    mod_factor = self.modulator(pos, z_new, z_past, coupling=self.coupling)
+                    z_new = mod_factor + (1 - self.coupling) * z_new
+                else:
+                    mod_factor = self.modulator(pos, z_new, z_past)
+                    z_new = z_new + self.coupling * mod_factor
 
-        # Photonic-style non-linearity (Mish) and normalization
-        z_new = mish(z_new.real) + 1j * mish(z_new.imag)
-        max_int = torch.max(torch.abs(z_new)**2)
-        if max_int > 0:
-            z_new = z_new * (self.norm_scale / torch.sqrt(max_int + EPS))
+            # Photonic-style non-linearity (Mish) and normalization
+            z_new = mish(z_new.real) + 1j * mish(z_new.imag)
+            # Complex LayerNorm (real and imag independently) + learned scaling
+            z_real = F.layer_norm(z_new.real, (z_new.real.size(-1),))
+            z_imag = F.layer_norm(z_new.imag, (z_new.imag.size(-1),))
+            z_new = (z_real + 1j * z_imag) * self.norm_scale
+            
         return z_new
 
 class MultiLayerPhotonicNN(torch.nn.Module):
@@ -261,7 +266,7 @@ class MultiLayerPhotonicNN(torch.nn.Module):
             z_current = z_current + self.pos_bias(i)
             
             for layer in self.layers:
-                z_current = layer(z_current, z_cache, i)
+                z_current = layer(z_current, z_cache, i, num_steps=M)
             if i < seq_len - 1:
                 logits_list.append(self.readout(z_current))
             z_cache.append(z_current)
@@ -430,7 +435,7 @@ def generate(prompt: str, max_new=180, temperature=0.92):
         z_curr = z_curr + model.pos_bias(i)
         
         for layer in model.layers:
-            z_curr = layer(z_curr, z_cache, i)
+            z_curr = layer(z_curr, z_cache, i, num_steps=M)
         z_cache.append(z_curr)
         logits = model.readout(z_curr)
 
@@ -451,7 +456,7 @@ def generate(prompt: str, max_new=180, temperature=0.92):
         z_curr = z_curr + model.pos_bias(current_pos)
         
         for layer in model.layers:
-            z_curr = layer(z_curr, z_cache, current_pos)
+            z_curr = layer(z_curr, z_cache, current_pos, num_steps=M)
         z_cache.append(z_curr)
         logits = model.readout(z_curr)
         current_pos += 1
@@ -476,7 +481,7 @@ def beam_search_generate(prompt: str, beam_width=BEAM_WIDTH, max_new=180, temper
         z_curr = model.token_embed(token_id).squeeze(0)
         z_curr = z_curr + model.pos_bias(i)
         for layer in model.layers:
-            z_curr = layer(z_curr, z_cache_init, i)
+            z_curr = layer(z_curr, z_cache_init, i, num_steps=M)
         z_cache_init.append(z_curr)
         logits = model.readout(z_curr)
 
@@ -510,7 +515,7 @@ def beam_search_generate(prompt: str, beam_width=BEAM_WIDTH, max_new=180, temper
                 
                 new_z_cache = z_cache.copy()
                 for layer in model.layers:
-                    z_curr = layer(z_curr, new_z_cache, current_pos)
+                    z_curr = layer(z_curr, new_z_cache, current_pos, num_steps=M)
                 new_z_cache.append(z_curr)
                 
                 new_beams.append((new_seq, new_logp, new_z_cache))
@@ -551,11 +556,13 @@ if __name__ == "__main__":
     parser.add_argument("--beam", action="store_true", help="Use beam search for generation")
     parser.add_argument("--beam_width", type=int, default=BEAM_WIDTH, help="Beam width")
     parser.add_argument("--test", action="store_true", help="Run final test suite")
+    parser.add_argument("--M", type=int, default=M, help="Internal evolution steps per layer")
     args = parser.parse_args()
 
     current_mode = args.mode
     EPOCHS = args.epochs
     STEPS_PER_EPOCH = args.steps
+    M = args.M
     
     # Initialize the model correctly before potentially loading
     init_model(mode=current_mode, num_layers=args.layers)

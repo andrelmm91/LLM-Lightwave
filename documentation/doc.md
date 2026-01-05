@@ -11,6 +11,7 @@ Tokens are projected into a complex space ($a + bi$) with an increased dimension
 - **Magnitude**: Represents the "intensity" or "strength" of a feature.
 - **Phase**: Encodes "timing," "order," and "relational" context naturally.
 - **Dimension Expansion**: The use of 16-dimensional embeddings allows the model to handle higher linguistic complexity compared to earlier versions.
+- **Positional Handling**: Instead of a hard sequence limit (`MAX_N`), the model uses a **Relative Positional Window** (defined by `REL_MAX_DIST`). It maintains a unique, high-resolution positional bias for relative distances up to 64 tokens, after which biases are smoothly clamped.
 
 ### 2. Mish Activation (Complex Domain)
 Lightwave utilizes the **Mish** activation function ($x \cdot \tanh(\text{softplus}(x))$) applied independently to the real and imaginary components.
@@ -23,7 +24,12 @@ Traditional Self-Attention has $O(N^2)$ complexity. Lightwave uses an optimized 
 - **Positional Scores**: Incorporates **Relative Positional Attention Bias** directly into the attention weights.
 - **Evolutionary context**: Instead of a global attention matrix, it modulates the current state as a function of the weighted historical field, maintaining high efficiency while capturing strong relational signals.
 
-### 4. Continuous Evolutionary Step
+### 4. Temporal Evolution Loop (Internal Steps $M$)
+To simulate the deep state refinement of photonic systems, each interference layer evolves the complex field **$M$ times** per token.
+- **Internal Propagation**: Allows the model to iteratively refine the modulation results before passing them to the next cascaded stage.
+- **Configurable Complexity**: The depth of refinement can be tuned via the `--M` flag without increasing the physical number of layers.
+
+### 5. Continuous Evolutionary Step
 The model is a **Dynamical System** where each token acts as an impulse that evolves the internal complex state. This transition from static embeddings to evolving fields allows for constant-time inference.
 
 ---
@@ -40,7 +46,7 @@ Each layer implements a physical interaction stage:
 2.  **Modulation**: Uses either a Neural Modulator or a Fixed Quantum Wave (QRW).
 3.  **Learnable Coupling**: The coupling strength is a per-layer learnable parameter ($\alpha$), initialized at 0.12, allowing the model to adaptively tune interference levels.
 4.  **Non-Linearity**: Applies **Mish** activation (simulating advanced photonic saturable absorbers).
-5.  **Normalization**: Maintains field intensity via a learnable `norm_scale`.
+5.  **Normalization**: Uses **Complex LayerNorm** (independent LayerNorm on real/imag) followed by a learnable `norm_scale` to maintain field stability.
 
 ---
 
@@ -84,6 +90,7 @@ The model now includes automated performance monitoring:
 | `--beam` | Use beam search decoding | False |
 | `--beam_width [N]` | Number of beams for search | 5 |
 | `--test` | Run final validation & tests | False |
+| `--M [N]` | Number of internal evolution steps per layer | 8 |
 
 ### Example Commands
 
