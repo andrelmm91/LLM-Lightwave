@@ -305,6 +305,12 @@ class PhotonicInterferenceLayer(torch.nn.Module):
 class MultiLayerPhotonicNN(torch.nn.Module):
     def __init__(self, num_layers=LAYERS_DEFAULT, mode="neural", use_lora=False, lora_rank=4, quant_bits=None):
         super().__init__()
+        self.num_layers = num_layers
+        self.mode = mode
+        self.use_lora = use_lora
+        self.lora_rank = lora_rank
+        self.quant_bits = quant_bits
+        
         self.token_embed = TokenEmbedding(VOCAB_SIZE)
         self.pos_bias = RelativePositionalBias()
         self.layers = torch.nn.ModuleList([
@@ -348,8 +354,11 @@ def save_checkpoint(path=None):
         'model_state': model.state_dict(),
         'optimizer_state': optimizer.state_dict(),
         'scheduler_state': scheduler.state_dict(),
-        'mode': current_mode,
-        'num_layers': len(model.layers)
+        'mode': model.mode,
+        'num_layers': model.num_layers,
+        'use_lora': model.use_lora,
+        'lora_rank': model.lora_rank,
+        'quant_bits': model.quant_bits
     }
     
     torch.save(checkpoint, "model.pth")
@@ -368,14 +377,45 @@ def load_checkpoint(path="model.pth"):
     
     saved_mode = checkpoint.get('mode', 'neural')
     saved_layers = checkpoint.get('num_layers', 4)
+    saved_lora = checkpoint.get('use_lora')
+    saved_rank = checkpoint.get('lora_rank', 4)
+    saved_quant = checkpoint.get('quant_bits', None)
+
+    # Heuristic: if use_lora is missing, check state_dict keys
+    if saved_lora is None:
+        model_state = checkpoint['model_state']
+        saved_lora = any("lora_" in k for k in model_state.keys())
+        if saved_lora:
+            # Try to infer rank from a lora_A parameter
+            for k, v in model_state.items():
+                if "lora_A" in k:
+                    saved_rank = v.size(0)
+                    break
 
     # Re-initialize model to match saved architecture if necessary
-    if saved_mode != current_mode or len(model.layers) != saved_layers:
-        print(f"Switching to mode {saved_mode} with {saved_layers} layers...")
-        current_mode = saved_mode
-        init_model(mode=saved_mode, num_layers=saved_layers)
+    arch_mismatch = (saved_mode != model.mode or 
+                     saved_layers != model.num_layers or 
+                     saved_lora != model.use_lora or 
+                     saved_rank != model.lora_rank or 
+                     saved_quant != model.quant_bits)
+
+    if arch_mismatch:
+        print(f"Switching architecture to match checkpoint: Mode={saved_mode}, Layers={saved_layers}, LoRA={saved_lora}, Rank={saved_rank}, Quant={saved_quant}")
+        init_model(mode=saved_mode, num_layers=saved_layers, use_lora=saved_lora, lora_rank=saved_rank, quant_bits=saved_quant)
 
     model.load_state_dict(checkpoint['model_state'])
+    
+    # If LoRA was active, we must re-filter the optimizer before loading its state
+    if saved_lora:
+        for name, param in model.named_parameters():
+            if "lora_" in name or "coupling" in name or "norm_scale" in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+        
+        optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=LR)
+        scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=LR*0.05)
+
     optimizer.load_state_dict(checkpoint['optimizer_state'])
     scheduler.load_state_dict(checkpoint['scheduler_state'])
     
