@@ -57,7 +57,7 @@ def get_random_chunk(text, length=SEQ_LEN):
 #  Load TinyStories (download manually from HF)
 # ────────────────────────────────────────────────────────────────
 # DATA_PATH = "debug_data.txt"  # for quick testing
-DATA_PATH = "TinyStories-train.txt"  # ← place downloaded file here
+DATA_PATH = "tinyStories-train.txt"  # ← place downloaded file here
 
 if not os.path.exists(DATA_PATH):
     raise FileNotFoundError(
