@@ -23,7 +23,10 @@ BATCH_SIZE = 8
 EPOCHS = 15
 STEPS_PER_EPOCH = 200
 LR = 4e-4
+EMBED_DIM = 16          # Increased: 8 real + 8 imaginary (or 16 pairs)
+BEAM_WIDTH = 5          # for beam search
 REL_MAX_DIST = 64
+GRAD_CLIP = 1.0
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
@@ -66,14 +69,16 @@ print(f"Loaded TinyStories: {len(full_text):,} characters | ~{len(full_text)//4:
 # ────────────────────────────────────────────────────────────────
 class TokenEmbedding(torch.nn.Module):
     """Project token ids to complex domain"""
-    def __init__(self, vocab_size, dim=2):
+    def __init__(self, vocab_size, dim=EMBED_DIM):
         super().__init__()
         self.dim = dim
-        self.embed = torch.nn.Embedding(vocab_size, dim * 2)  # real + imag
+        self.embed = torch.nn.Embedding(vocab_size, dim)  # real part
+        self.imag_embed = torch.nn.Embedding(vocab_size, dim)  # imaginary part
 
     def forward(self, ids):
-        emb = self.embed(ids)           # [..., dim*2]
-        return emb[..., :self.dim] + 1j * emb[..., self.dim:]  # complex
+        real = self.embed(ids)
+        imag = self.imag_embed(ids)
+        return real + 1j * imag  # shape: [..., dim]
 
 class RelativePositionalBias(torch.nn.Module):
     def __init__(self, max_rel_dist=REL_MAX_DIST):
@@ -90,7 +95,7 @@ class RelativePositionalBias(torch.nn.Module):
         return self.bias[idx]
 
 class MultiHeadModulator(torch.nn.Module):
-    def __init__(self, dim=2, heads=H):
+    def __init__(self, dim=EMBED_DIM, heads=H):
         super().__init__()
         self.dim = dim
         self.heads = torch.nn.ModuleList([
@@ -142,7 +147,7 @@ class MultiHeadModulator(torch.nn.Module):
         return mod + biases.mean()
 
 class ReadoutHead(torch.nn.Module):
-    def __init__(self, dim=2, vocab_size=VOCAB_SIZE):
+    def __init__(self, dim=EMBED_DIM, vocab_size=VOCAB_SIZE):
         super().__init__()
         self.proj = torch.nn.Linear(dim * 2, vocab_size)
 
@@ -357,6 +362,82 @@ def generate(prompt: str, max_new=180, temperature=0.92):
     return tokenizer.decode(generated_tokens.tolist())
 
 # ────────────────────────────────────────────────────────────────
+#  Beam Search Generation
+# ────────────────────────────────────────────────────────────────
+@torch.no_grad()
+def beam_search_generate(prompt: str, beam_width=BEAM_WIDTH, max_new=180, temperature=0.9):
+    model.eval()
+    prompt_tokens = torch.tensor(tokenizer.encode(prompt), device=DEVICE)
+    prompt_len = len(prompt_tokens)
+
+    # Beam element: (sequence_tensor, log_prob, z_cache_list)
+    # Start with prefilling the cache for the prompt
+    z_cache_init = []
+    logits = None
+    for i in range(prompt_len):
+        token_id = prompt_tokens[i:i+1]
+        z_curr = model.token_embed(token_id).squeeze(0)
+        z_curr = z_curr + model.pos_bias(i)
+        for layer in model.layers:
+            z_curr = layer(z_curr, z_cache_init, i)
+        z_cache_init.append(z_curr)
+        logits = model.readout(z_curr)
+
+    beams = [(prompt_tokens.clone(), 0.0, z_cache_init)]
+
+    for step in range(max_new):
+        new_beams = []
+        for seq, logp, z_cache in beams:
+            # Get logits for the LAST token in the current sequence
+            # Wait, the way incremental works: we need the z_cache to produce logits for NEXT token
+            # z_cache[-1] already went through layers, so readout(z_cache[-1]) gives next token logits
+            logits = model.readout(z_cache[-1]) / temperature
+            probs = F.softmax(logits, dim=-1)
+            top_probs, top_ids = probs.topk(beam_width)
+
+            for k in range(beam_width):
+                new_token = top_ids[k:k+1]
+                new_logp = logp + torch.log(top_probs[k] + 1e-10).item()
+                
+                # Check if it was already EOT
+                if seq[-1].item() == tokenizer.eot_token:
+                    new_beams.append((seq, logp, z_cache))
+                    continue
+
+                new_seq = torch.cat([seq, new_token])
+                
+                # Update cache for the new token
+                current_pos = len(seq)
+                z_curr = model.token_embed(new_token).squeeze(0)
+                z_curr = z_curr + model.pos_bias(current_pos)
+                
+                new_z_cache = z_cache.copy()
+                for layer in model.layers:
+                    z_curr = layer(z_curr, new_z_cache, current_pos)
+                new_z_cache.append(z_curr)
+                
+                new_beams.append((new_seq, new_logp, new_z_cache))
+
+        # Keep top beam_width, penalizing length slightly or just sorting
+        # Avoid duplicate sequences if any (though unlikely here)
+        unique_beams = {}
+        for s, l, c in new_beams:
+            s_tuple = tuple(s.tolist())
+            if s_tuple not in unique_beams or unique_beams[s_tuple][0] < l:
+                unique_beams[s_tuple] = (l, s, c)
+        
+        beams = sorted(unique_beams.values(), key=lambda x: x[0], reverse=True)[:beam_width]
+        beams = [(s, l, c) for l, s, c in beams]
+
+        # Early stop if ALL beams ended with EOT
+        if all(b[0][-1].item() == tokenizer.eot_token for b in beams):
+            break
+
+    # Return best sequence
+    best_seq = beams[0][0]
+    return tokenizer.decode(best_seq.tolist())
+
+# ────────────────────────────────────────────────────────────────
 #  Run
 # ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
@@ -370,6 +451,8 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=EPOCHS, help="Number of training epochs")
     parser.add_argument("--steps", type=int, default=STEPS_PER_EPOCH, help="Steps per epoch")
     parser.add_argument("--prompt", type=str, default="Once upon a time there was a little girl who loved to", help="Prompt for generation")
+    parser.add_argument("--beam", action="store_true", help="Use beam search for generation")
+    parser.add_argument("--beam_width", type=int, default=BEAM_WIDTH, help="Beam width")
     args = parser.parse_args()
 
     current_mode = args.mode

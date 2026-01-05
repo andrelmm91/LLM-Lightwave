@@ -7,9 +7,10 @@
 Unlike standard LLMs which operate entirely in the real-number domain, Lightwave leverages the rich dynamics of complex arithmetic.
 
 ### 1. Complex-Valued Embeddings
-Tokens are projected into a complex space ($a + bi$). 
+Tokens are projected into a complex space ($a + bi$) with an increased dimensionality of **16** (8 real + 8 imaginary pairs by default).
 - **Magnitude**: Represents the "intensity" or "strength" of a feature.
 - **Phase**: Encodes "timing," "order," and "relational" context naturally.
+- **Dimension Expansion**: The use of 16-dimensional embeddings allows the model to handle higher linguistic complexity compared to earlier versions.
 
 ### 2. Multi-Head Modulator
 Traditional Self-Attention has $O(N^2)$ complexity. Lightwave uses a **Multi-Head Modulator**:
@@ -46,6 +47,12 @@ Strictly follows a **Discrete-time Quantum Random Walk (QRW)**:
 $\begin{pmatrix} u \\ v \end{pmatrix}_{next} = \frac{1}{\sqrt{2}} \begin{pmatrix} 1 & i \\ i & 1 \end{pmatrix} \begin{pmatrix} u_{past} \\ v_{curr} \end{pmatrix}$
 This mode has **Zero** trainable parameters in the modulator core, relying on pure unitary interference.
 
+### 3. Beam Search Decoding
+Beyond greedy decoding, Lightwave now supports **Beam Search**:
+- Maintains multiple top-k hypotheses (beams) during generation.
+- Corrects potential local errors by exploring multiple high-probability paths simultaneously.
+- Configurable via `--beam` and `--beam_width`.
+
 ---
 
 ## Command Line Interface (CLI)
@@ -61,11 +68,14 @@ This mode has **Zero** trainable parameters in the modulator core, relying on pu
 | `--epochs [N]` | Training epochs | 15 |
 | `--steps [N]` | Steps per epoch | 200 |
 | `--prompt "[TEXT]"` | Prompt for generation | (TinyStories intro) |
+| `--beam` | Use beam search decoding | False |
+| `--beam_width [N]` | Number of beams for search | 5 |
 
 ### Example Commands
 - **Train Depth-8 Wave Model**: `python llm_light.py --train --mode wave --layers 8`
-- **Generate from Specific Version**: `python llm_light.py --generate --load --checkpoint model.pTh --prompt "there was a dog"`
-
+- **Generate from Specific Version**: `python llm_light.py --generate --load --checkpoint model.pth --prompt "there was a dog"`
+- **Beam Search Generation**: `python llm_light.py --generate --beam --beam_width 10 --prompt "Once upon a time"`
+- **Quick training setup**: `python llm_light.py --train --epochs 1 --steps 1`
 ---
 
 ## Checkpointing
