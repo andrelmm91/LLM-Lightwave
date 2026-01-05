@@ -12,12 +12,17 @@ Tokens are projected into a complex space ($a + bi$) with an increased dimension
 - **Phase**: Encodes "timing," "order," and "relational" context naturally.
 - **Dimension Expansion**: The use of 16-dimensional embeddings allows the model to handle higher linguistic complexity compared to earlier versions.
 
-### 2. Multi-Head Modulator
+### 2. Mish Activation (Complex Domain)
+Lightwave utilizes the **Mish** activation function ($x \cdot \tanh(\text{softplus}(x))$) applied independently to the real and imaginary components.
+- **Smooth Gradient**: Unlike `tanh`, Mish avoids early saturation, preserving gradient information during deep propagation.
+- **Dynamic Response**: Provides a more nuanced non-linear mapping for photonic field interactions.
+
+### 3. Multi-Head Modulator
 Traditional Self-Attention has $O(N^2)$ complexity. Lightwave uses a **Multi-Head Modulator**:
 - Calculates how the current token modulates the accumulated historical field (`z_cache`).
 - Uses **Relative Positional Bias** for sequence awareness without the heavy cost of standard attention.
 
-### 3. Evolutionary Incremental Step
+### 4. Continuous Evolutionary Step
 The model is a **Dynamical System** where each token acts as an impulse that evolves the internal complex state. This transition from static embeddings to evolving fields allows for constant-time inference.
 
 ---
@@ -28,12 +33,13 @@ The model uses a **Deep Cascaded Architecture** to simulate multiple stages of l
 
 `Input → Embedding → [ Layer 1 ] → [ Layer 2 ] → ... → [ Layer L ] → Readout`
 
-### Photonic Interference Layer
+#### Photonic Interference Layer
 Each layer implements a physical interaction stage:
 1.  **Interference**: The current state interacts with the global historical field.
 2.  **Modulation**: Uses either a Neural Modulator or a Fixed Quantum Wave (QRW).
-3.  **Non-Linearity**: Applies `tanh` activation (simulating photonic saturable absorbers).
-4.  **Normalization**: Maintains field intensity via a learnable `norm_scale`.
+3.  **Learnable Coupling**: The coupling strength is a per-layer learnable parameter ($\alpha$), initialized at 0.12, allowing the model to adaptively tune interference levels.
+4.  **Non-Linearity**: Applies **Mish** activation (simulating advanced photonic saturable absorbers).
+5.  **Normalization**: Maintains field intensity via a learnable `norm_scale`.
 
 ---
 
@@ -79,10 +85,26 @@ The model now includes automated performance monitoring:
 | `--test` | Run final validation & tests | False |
 
 ### Example Commands
-- **Train Depth-8 Wave Model**: `python llm_light.py --train --mode wave --layers 8`
-- **Generate from Specific Version**: `python llm_light.py --generate --load --checkpoint model.pth --prompt "there was a dog"`
-- **Beam Search Generation**: `python llm_light.py --generate --beam --beam_width 10 --prompt "Once upon a time"`
-- **Quick training setup**: `python llm_light.py --train --epochs 1 --steps 1`
+
+#### Training
+- **Quick Verification**: `python llm_light.py --train --epochs 1 --steps 5`
+  > [!NOTE]
+  > Use this to verify data loading, training steps, and the validation loop without waiting for a full run.
+- **Standard Neural Training**: `python llm_light.py --train --mode neural --layers 4 --epochs 15`
+- **Deep Wave Architecture**: `python llm_light.py --train --mode wave --layers 12`
+  > [!TIP]
+  > Wave mode uses fixed unitary matrices, requiring much less VRAM but benefiting from deeper cascaded layers.
+
+#### Generation
+- **Standard (Greedy)**: `python llm_light.py --generate --prompt "The princess found a"`
+- **Beam Search (Default Width 5)**: `python llm_light.py --generate --beam --prompt "In a small house"`
+- **Precision Beam Search**: `python llm_light.py --generate --beam --beam_width 10 --prompt "Once upon a time"`
+- **Load Best Model & Generate**: `python llm_light.py --generate --load --checkpoint best_model_valppl_15.39.pt --beam`
+
+#### Evaluation & Testing
+- **Standalone Evaluation**: `python llm_light.py --test --load --checkpoint model.pth`
+  > [!NOTE]
+  > This runs a full validation perplexity check and generates text for 5 distinct test prompts to assess qualitative quality.
 ---
 
 ## Checkpointing

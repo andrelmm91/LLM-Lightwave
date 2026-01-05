@@ -12,6 +12,13 @@ import argparse
 from datetime import datetime
 
 # ────────────────────────────────────────────────────────────────
+#  Utils
+# ────────────────────────────────────────────────────────────────
+def mish(x):
+    """Mish activation function: x * tanh(softplus(x))"""
+    return x * torch.tanh(F.softplus(x))
+
+# ────────────────────────────────────────────────────────────────
 #  Hyperparameters
 # ────────────────────────────────────────────────────────────────
 MAX_N = 512
@@ -28,6 +35,7 @@ EMBED_DIM = 16          # Increased: 8 real + 8 imaginary (or 16 pairs)
 BEAM_WIDTH = 5          # for beam search
 REL_MAX_DIST = 64
 GRAD_CLIP = 1.0
+LAYERS_DEFAULT = 4
 VAL_STEPS = 100         # Number of validation chunks per epoch
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -177,13 +185,13 @@ class QuantumWaveModulator(torch.nn.Module):
             [0.0 + 1.0j, 1.0 + 0.0j]
         ], dtype=torch.complex64) / (2.0**0.5))
 
-    def forward(self, curr_pos, z_curr, z_past):
+    def forward(self, curr_pos, z_curr, z_past, coupling=0.12):
         if z_past.numel() == 0:
             return torch.zeros_like(z_curr)
         u_prev = z_past[-1, 0]
         v_curr = z_curr[1]
         state = torch.stack([u_prev, v_curr])
-        out = (self.coin * COUPLING) @ state
+        out = (self.coin * coupling) @ state
         return out
 
 class PhotonicInterferenceLayer(torch.nn.Module):
@@ -195,6 +203,7 @@ class PhotonicInterferenceLayer(torch.nn.Module):
             self.modulator = MultiHeadModulator()
         else:
             self.modulator = QuantumWaveModulator()
+        self.coupling = torch.nn.Parameter(torch.tensor(0.12))
         self.norm_scale = torch.nn.Parameter(torch.tensor(1.0))
 
     def forward(self, candidate, z_cache, pos):
@@ -202,14 +211,15 @@ class PhotonicInterferenceLayer(torch.nn.Module):
             z_new = candidate
         else:
             z_past = torch.stack(z_cache)
-            mod_factor = self.modulator(pos, candidate, z_past)
             if self.mode == "wave":
-                z_new = mod_factor + (1 - COUPLING) * candidate
+                mod_factor = self.modulator(pos, candidate, z_past, coupling=self.coupling)
+                z_new = mod_factor + (1 - self.coupling) * candidate
             else:
-                z_new = candidate + COUPLING * mod_factor
+                mod_factor = self.modulator(pos, candidate, z_past)
+                z_new = candidate + self.coupling * mod_factor
 
-        # Photonic-style non-linearity and normalization
-        z_new = torch.tanh(z_new.real) + 1j * torch.tanh(z_new.imag)
+        # Photonic-style non-linearity (Mish) and normalization
+        z_new = mish(z_new.real) + 1j * mish(z_new.imag)
         max_int = torch.max(torch.abs(z_new)**2)
         if max_int > 0:
             z_new = z_new * (self.norm_scale / torch.sqrt(max_int + EPS))
@@ -518,7 +528,7 @@ if __name__ == "__main__":
     parser.add_argument("--load", action="store_true", help="Load checkpoint before running")
     parser.add_argument("--checkpoint", type=str, default="model.pth", help="Path to specific checkpoint file")
     parser.add_argument("--mode", type=str, choices=["neural", "wave"], default="neural", help="Modulator mode")
-    parser.add_argument("--layers", type=int, default=4, help="Number of layers")
+    parser.add_argument("--layers", type=int, default=LAYERS_DEFAULT, help="Number of layers")
     parser.add_argument("--epochs", type=int, default=EPOCHS, help="Number of training epochs")
     parser.add_argument("--steps", type=int, default=STEPS_PER_EPOCH, help="Steps per epoch")
     parser.add_argument("--prompt", type=str, default="Once upon a time there was a little girl who loved to", help="Prompt for generation")
