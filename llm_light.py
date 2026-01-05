@@ -394,6 +394,132 @@ def train():
     print("Training finished.")
 
 # ────────────────────────────────────────────────────────────────
+#  Reinforcement Learning for Self-Improvement (RLVR)
+# ────────────────────────────────────────────────────────────────
+
+class RewardVerifier:
+    """Objective verifier for sequence quality"""
+    @staticmethod
+    def get_reward(text, prompt):
+        reward = 0.0
+        # 1. Length reward: Encourage moderate length (e.g. 50-150 chars)
+        length = len(text)
+        if 50 < length < 300:
+            reward += 1.0
+        
+        # 2. Non-repetition: Penalty for repetitive chunks
+        words = text.lower().split()
+        if len(words) > 10:
+            unique_ratio = len(set(words)) / len(words)
+            reward += unique_ratio * 2.0
+            
+        # 3. Task Success: Does it actually continue the prompt?
+        # Simple heuristic: Does it contain new words not in the prompt?
+        prompt_words = set(prompt.lower().split())
+        new_words = set(words) - prompt_words
+        if len(new_words) > 5:
+            reward += 1.5
+            
+        # 4. Termination: Bonus for ending with punctuation
+        if text.strip()[-1] in ".!?":
+            reward += 1.0
+            
+        return reward
+
+def rl_train(steps=100, samples_per_step=4):
+    print(f"RLVR Fine-tuning started | Steps: {steps} | Sparse Updates")
+    model.train()
+    
+    # Sparse Optimization: Freeze Embedding and Readout, only update Modulators
+    for name, param in model.named_parameters():
+        if "modulator" in name or "coupling" in name or "norm_scale" in name:
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
+            
+    rl_optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=LR * 0.5)
+    
+    for step in range(steps):
+        # 1. Sample a random prompt from train text
+        prompt_raw = get_random_chunk(train_text, length=64)
+        prompt = tokenizer.decode(prompt_raw.tolist())
+        
+        batch_loss = 0.0
+        total_reward = 0.0
+        
+        for _ in range(samples_per_step):
+            # 2. Rollout: Generate with tracking gradients
+            # We need a modified generate that tracks log_probs
+            trajectory_tokens, log_probs = rollout(prompt, max_new=50)
+            generated_text = tokenizer.decode(trajectory_tokens.tolist())
+            
+            # 3. Verify: Get reward
+            reward = RewardVerifier.get_reward(generated_text, prompt)
+            total_reward += reward
+            
+            # 4. Policy Gradient (REINFORCE)
+            # Loss = - Reward * sum(log_probs)
+            loss = -reward * sum(log_probs)
+            batch_loss += loss / samples_per_step
+            
+        if samples_per_step > 0:
+            rl_optimizer.zero_grad()
+            batch_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            rl_optimizer.step()
+            
+        if (step + 1) % 5 == 0:
+            print(f"RL Step {step+1:3d} | Avg Reward: {total_reward/samples_per_step:.2f} | Loss: {batch_loss.item():.4f}")
+
+    # Restore all parameters to trainable for standard SFT if needed later
+    for param in model.parameters():
+        param.requires_grad = True
+    
+    save_path = f"model_rl_{datetime.now().strftime('%Y%m%d_%H%M')}.pth"
+    torch.save(model.state_dict(), save_path)
+    print(f"RL Fine-tuning finished. Saved to {save_path}")
+
+def rollout(prompt, max_new=50, temperature=0.9):
+    """Generate a sequence while tracking log-probabilities for RL"""
+    prompt_tokens = torch.tensor(tokenizer.encode(prompt, disallowed_special=()), device=DEVICE)
+    z_cache = []
+    
+    # Process prompt
+    for i in range(len(prompt_tokens)):
+        token_id = prompt_tokens[i:i+1]
+        z_curr = model.token_embed(token_id).squeeze(0)
+        z_curr = z_curr + model.pos_bias(i)
+        for layer in model.layers:
+            z_curr = layer(z_curr, z_cache, i, num_steps=M)
+        z_cache.append(z_curr)
+        logits = model.readout(z_curr)
+
+    trajectory = []
+    log_probs = []
+    current_pos = len(prompt_tokens)
+    
+    for _ in range(max_new):
+        probs = F.softmax(logits / temperature, dim=-1)
+        dist = torch.distributions.Categorical(probs)
+        next_token = dist.sample()
+        
+        trajectory.append(next_token)
+        log_probs.append(dist.log_prob(next_token))
+        
+        if next_token.item() == tokenizer.eot_token:
+            break
+            
+        z_curr = model.token_embed(next_token.unsqueeze(0)).squeeze(0)
+        z_curr = z_curr + model.pos_bias(current_pos)
+        for layer in model.layers:
+            z_curr = layer(z_curr, z_cache, current_pos, num_steps=M)
+        z_cache.append(z_curr)
+        logits = model.readout(z_curr)
+        current_pos += 1
+        
+    return torch.stack(trajectory), torch.stack(log_probs)
+
+# ────────────────────────────────────────────────────────────────
 #  Final Test after training
 # ────────────────────────────────────────────────────────────────
 def run_final_tests():
@@ -424,7 +550,7 @@ def run_final_tests():
 # ────────────────────────────────────────────────────────────────
 @torch.no_grad()
 def generate(prompt: str, max_new=180, temperature=0.92):
-    prompt_tokens = torch.tensor(tokenizer.encode(prompt), device=DEVICE)
+    prompt_tokens = torch.tensor(tokenizer.encode(prompt, disallowed_special=()), device=DEVICE)
     z_cache = []
 
     # Process prompt tokens
@@ -469,7 +595,7 @@ def generate(prompt: str, max_new=180, temperature=0.92):
 @torch.no_grad()
 def beam_search_generate(prompt: str, beam_width=BEAM_WIDTH, max_new=180, temperature=0.9):
     model.eval()
-    prompt_tokens = torch.tensor(tokenizer.encode(prompt), device=DEVICE)
+    prompt_tokens = torch.tensor(tokenizer.encode(prompt, disallowed_special=()), device=DEVICE)
     prompt_len = len(prompt_tokens)
 
     # Beam element: (sequence_tensor, log_prob, z_cache_list)
@@ -556,13 +682,12 @@ if __name__ == "__main__":
     parser.add_argument("--beam", action="store_true", help="Use beam search for generation")
     parser.add_argument("--beam_width", type=int, default=BEAM_WIDTH, help="Beam width")
     parser.add_argument("--test", action="store_true", help="Run final test suite")
-    parser.add_argument("--M", type=int, default=M, help="Internal evolution steps per layer")
+    parser.add_argument("--rl_train", action="store_true", help="Start RLVR self-improvement training")
     args = parser.parse_args()
 
     current_mode = args.mode
     EPOCHS = args.epochs
     STEPS_PER_EPOCH = args.steps
-    M = args.M
     
     # Initialize the model correctly before potentially loading
     init_model(mode=current_mode, num_layers=args.layers)
@@ -572,6 +697,10 @@ if __name__ == "__main__":
 
     if args.train:
         train()
+        run_final_tests()
+
+    if args.rl_train:
+        rl_train(steps=args.steps)
         run_final_tests()
 
     if args.test and not args.train:

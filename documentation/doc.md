@@ -72,6 +72,12 @@ The model now includes automated performance monitoring:
 - **Perplexity ($PPL$):** Tracked after each epoch on held-out validation data ($PPL = e^{loss}$).
 - **Best Model Saving**: Automatically saves the model with the lowest validation perplexity as `best_model_valppl_*.pt`.
 
+### 5. Reinforcement Learning (RLVR)
+Lightwave supports post-training self-improvement via **Reinforcement Learning from Verifiable Rewards**:
+- **Verifier-Based Rewards**: Responses are analyzed by a `RewardVerifier` which scores coherence, length, and task success.
+- **Sparse Optimization**: During RL fine-tuning, only the modulator parameters ($\alpha$ and multi-head projections) are updated, preserving the foundational linguistic knowledge while refining the attention policy.
+- **Scaling**: Allows the model to improve on specific tasks or styles without massive additional Supervised Fine-Tuning (SFT) data.
+
 ---
 
 ## Command Line Interface (CLI)
@@ -90,6 +96,7 @@ The model now includes automated performance monitoring:
 | `--beam` | Use beam search decoding | False |
 | `--beam_width [N]` | Number of beams for search | 5 |
 | `--test` | Run final validation & tests | False |
+| `--rl_train` | Start RLVR fine-tuning loop | False |
 | `--M [N]` | Number of internal evolution steps per layer | 8 |
 
 ### Example Commands
@@ -102,6 +109,12 @@ The model now includes automated performance monitoring:
 - **Deep Wave Architecture**: `python llm_light.py --train --mode wave --layers 12`
   > [!TIP]
   > Wave mode uses fixed unitary matrices, requiring much less VRAM but benefiting from deeper cascaded layers.
+
+#### Self-Improvement (RLVR)
+- **Quick RL Verification**: `python llm_light.py --rl_train --steps 2 --prompt "Once upon a time"`
+  > [!NOTE]
+  > Use this to verify the reward logic and policy gradient update without a full fine-tuning run.
+- **Standard RL Fine-tuning**: `python llm_light.py --rl_train --load --checkpoint model.pth --steps 100`
 
 #### Generation
 - **Standard (Greedy)**: `python llm_light.py --generate --prompt "The princess found a"`
