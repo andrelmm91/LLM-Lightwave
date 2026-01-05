@@ -17,10 +17,11 @@ Lightwave utilizes the **Mish** activation function ($x \cdot \tanh(\text{softpl
 - **Smooth Gradient**: Unlike `tanh`, Mish avoids early saturation, preserving gradient information during deep propagation.
 - **Dynamic Response**: Provides a more nuanced non-linear mapping for photonic field interactions.
 
-### 3. Multi-Head Modulator
-Traditional Self-Attention has $O(N^2)$ complexity. Lightwave uses a **Multi-Head Modulator**:
-- Calculates how the current token modulates the accumulated historical field (`z_cache`).
-- Uses **Relative Positional Bias** for sequence awareness without the heavy cost of standard attention.
+### 3. Multi-Head Modulator (Attention Upgrade)
+Traditional Self-Attention has $O(N^2)$ complexity. Lightwave uses an optimized **Complex Dot-Product Attention** mechanism:
+- **Dot-Product Scores**: Calculates interaction strength using `real(conj(Q) * K)` per head.
+- **Positional Scores**: Incorporates **Relative Positional Attention Bias** directly into the attention weights.
+- **Evolutionary context**: Instead of a global attention matrix, it modulates the current state as a function of the weighted historical field, maintaining high efficiency while capturing strong relational signals.
 
 ### 4. Continuous Evolutionary Step
 The model is a **Dynamical System** where each token acts as an impulse that evolves the internal complex state. This transition from static embeddings to evolving fields allows for constant-time inference.

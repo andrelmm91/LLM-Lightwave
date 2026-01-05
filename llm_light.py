@@ -97,10 +97,12 @@ class TokenEmbedding(torch.nn.Module):
         return real + 1j * imag  # shape: [..., dim]
 
 class RelativePositionalBias(torch.nn.Module):
-    def __init__(self, max_rel_dist=REL_MAX_DIST):
+    def __init__(self, max_rel_dist=REL_MAX_DIST, dim=EMBED_DIM):
         super().__init__()
+        self.dim = dim
         size = 2 * max_rel_dist + 1
-        self.bias = torch.nn.Parameter(torch.randn(size, dtype=torch.complex64) * 0.02)
+        # Vector bias per position: [size, dim]
+        self.bias = torch.nn.Parameter(torch.randn(size, dim, dtype=torch.complex64) * 0.02)
 
     def forward(self, rel_dist):
         idx = rel_dist + REL_MAX_DIST
@@ -114,11 +116,16 @@ class MultiHeadModulator(torch.nn.Module):
     def __init__(self, dim=EMBED_DIM, heads=H):
         super().__init__()
         self.dim = dim
-        self.heads = torch.nn.ModuleList([
-            torch.nn.Linear(dim * 2 * 2, dim * 2) for _ in range(heads)
-        ])
-        self.out_proj = torch.nn.Linear(heads * dim * 2, dim * 2)
-        self.rel_bias = RelativePositionalBias()
+        self.heads = heads
+        self.head_dim = dim // heads
+        
+        # Projections for Q, K, V
+        self.q_proj = torch.nn.Linear(dim * 2, dim * 2)
+        self.k_proj = torch.nn.Linear(dim * 2, dim * 2)
+        self.v_proj = torch.nn.Linear(dim * 2, dim * 2)
+        self.out_proj = torch.nn.Linear(dim * 2, dim * 2)
+        
+        self.rel_bias = RelativePositionalBias(dim=dim)
 
     def forward(self, curr_pos: int, z_curr, z_past):
         if z_past.numel() == 0:
@@ -126,41 +133,50 @@ class MultiHeadModulator(torch.nn.Module):
 
         past_len = z_past.size(0)
         
-        # Prepare inputs
-        z_curr_rep = z_curr.unsqueeze(0).expand(past_len, -1) # [N, dim]
+        # 1. Project to Q, K, V (using real views for Linear layers)
+        q_real = torch.view_as_real(z_curr).flatten()
+        q_proj = self.q_proj(q_real)
         
-        # Concatenate features: [N, 2*dim] complex
-        features_c = torch.cat([z_curr_rep, z_past], dim=-1)
+        k_past_real = torch.view_as_real(z_past).flatten(start_dim=-2)
+        k_proj = self.k_proj(k_past_real)
         
-        # View as real: [N, 2*dim * 2] floats
-        # view_as_real adds a last dim of 2. Flatten that.
-        features = torch.view_as_real(features_c).flatten(start_dim=-2)
+        v_past_real = torch.view_as_real(z_past).flatten(start_dim=-2)
+        v_proj = self.v_proj(v_past_real)
         
-        # Heads
-        head_outs = []
-        for head in self.heads:
-            h = torch.tanh(head(features)) # [N, dim*2]
-            head_outs.append(h)
-            
-        # Cat heads: [N, H * dim * 2]
-        combined = torch.cat(head_outs, dim=-1)
+        # 2. Back to complex and split heads
+        q_c = torch.view_as_complex(q_proj.view(self.dim, 2))
+        k_c = torch.view_as_complex(k_proj.view(-1, self.dim, 2))
+        v_c = torch.view_as_complex(v_proj.view(-1, self.dim, 2))
         
-        # Aggregate over past (mean)
-        combined_mean = combined.mean(dim=0) # [H * dim * 2]
+        q_h = q_c.view(self.heads, self.head_dim)          # [H, d]
+        k_h = k_c.view(past_len, self.heads, self.head_dim) # [N, H, d]
+        v_h = v_c.view(past_len, self.heads, self.head_dim) # [N, H, d]
         
-        # Output projection
-        out = self.out_proj(combined_mean) # [dim * 2]
+        # 3. Upgrade A: Dot-product style scores
+        # scores: real(conj(Q) * K) summed over head_dim
+        # Broadcast conj(q_h) across past tokens
+        dot_scores = torch.real((torch.conj(q_h).unsqueeze(0) * k_h).sum(dim=-1)) # [N, H]
         
-        # Back to complex
-        mod = torch.view_as_complex(out.view(self.dim, 2))
-        
-        # Bias
+        # 4. Upgrade B: Relative positional attention bias
         rel_dists = torch.arange(curr_pos - past_len, curr_pos, device=DEVICE)
-        biases = self.rel_bias(rel_dists) # [N]
-        # Expand biases to [dim]? It is scalar complex.
-        # Broadcasting handles it.
+        rel_biases_c = self.rel_bias(rel_dists) # [N, dim]
+        rel_biases_h = rel_biases_c.view(past_len, self.heads, self.head_dim)
         
-        return mod + biases.mean()
+        rel_scores = torch.real((torch.conj(q_h).unsqueeze(0) * rel_biases_h).sum(dim=-1)) # [N, H]
+        
+        # 5. Combine and Softmax
+        final_scores = (dot_scores + rel_scores) / math.sqrt(self.head_dim)
+        weights = F.softmax(final_scores, dim=0) # [N, H]
+        
+        # 6. Weighted sum of values
+        # weights: [N, H] -> [N, H, 1]
+        out_h = (weights.unsqueeze(-1) * v_h).sum(dim=0) # [H, d]
+        
+        # 7. Final Projection
+        out_c = out_h.view(self.dim)
+        out_proj = self.out_proj(torch.view_as_real(out_c).flatten())
+        
+        return torch.view_as_complex(out_proj.view(self.dim, 2))
 
 class ReadoutHead(torch.nn.Module):
     def __init__(self, dim=EMBED_DIM, vocab_size=VOCAB_SIZE):
