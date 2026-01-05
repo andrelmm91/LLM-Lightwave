@@ -3,6 +3,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import numpy as np
+import math
 from tqdm import tqdm
 import random
 import os
@@ -27,6 +28,7 @@ EMBED_DIM = 16          # Increased: 8 real + 8 imaginary (or 16 pairs)
 BEAM_WIDTH = 5          # for beam search
 REL_MAX_DIST = 64
 GRAD_CLIP = 1.0
+VAL_STEPS = 100         # Number of validation chunks per epoch
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
@@ -37,10 +39,10 @@ print(f"Using device: {DEVICE}")
 tokenizer = tiktoken.get_encoding("gpt2")
 VOCAB_SIZE = tokenizer.n_vocab  # ~50257
 
-def get_random_chunk(length=SEQ_LEN):
-    """Sample random contiguous chunk from TinyStories text"""
-    start = random.randint(0, len(full_text) - length - 1)
-    chunk = full_text[start:start + length]
+def get_random_chunk(text, length=SEQ_LEN):
+    """Sample random contiguous chunk from given text"""
+    start = random.randint(0, len(text) - length - 1)
+    chunk = text[start:start + length]
     tokens = torch.tensor(tokenizer.encode(chunk, disallowed_special=()), dtype=torch.long, device=DEVICE)
     if len(tokens) < length:
         tokens = F.pad(tokens, (0, length - len(tokens)), value=tokenizer.eot_token)
@@ -62,7 +64,13 @@ if not os.path.exists(DATA_PATH):
 with open(DATA_PATH, 'r', encoding='utf-8') as f:
     full_text = f.read()
 
-print(f"Loaded TinyStories: {len(full_text):,} characters | ~{len(full_text)//4:,} tokens")
+# Rough split: last 5% for validation
+split_idx = int(len(full_text) * 0.95)
+train_text = full_text[:split_idx]
+val_text = full_text[split_idx:]
+
+print(f"Loaded TinyStories: {len(full_text):,} characters")
+print(f"Train: {len(train_text):,} | Val: {len(val_text):,}")
 
 # ────────────────────────────────────────────────────────────────
 #  Modules (same as before + token embedding)
@@ -286,36 +294,99 @@ def load_checkpoint(path="model.pth"):
     return True
 
 # ────────────────────────────────────────────────────────────────
+#  Validation perplexity
+# ────────────────────────────────────────────────────────────────
+@torch.no_grad()
+def validate():
+    model.eval()
+    total_loss = 0.0
+    num_samples = 0
+
+    for _ in range(VAL_STEPS):
+        seq = get_random_chunk(val_text)
+        logits = model.forward_incremental(seq)
+        target = seq[1:]
+        loss = F.cross_entropy(logits, target, ignore_index=tokenizer.eot_token, reduction='sum')
+        total_loss += loss.item()
+        num_samples += target.numel()
+
+    avg_loss = total_loss / num_samples
+    perplexity = math.exp(avg_loss)
+    return perplexity, avg_loss
+
+# ────────────────────────────────────────────────────────────────
 #  Training loop (same structure, real chunks)
 # ────────────────────────────────────────────────────────────────
 def train():
-    print("Training started on TinyStories with real BPE tokenizer...")
+    print(f"Training started on TinyStories | Val steps: {VAL_STEPS}")
+    best_val_ppl = float('inf')
+
     for epoch in range(EPOCHS):
-        total_loss = 0.0
+        model.train()
+        total_train_loss = 0.0
         steps = 0
 
-        with tqdm(total=STEPS_PER_EPOCH, desc=f"Epoch {epoch+1}/{EPOCHS}") as pbar:
+        with tqdm(total=STEPS_PER_EPOCH, desc=f"Epoch {epoch+1}/{EPOCHS} Train") as pbar:
             while steps < STEPS_PER_EPOCH:
-                seq = get_random_chunk(SEQ_LEN)
+                seq = get_random_chunk(train_text)
                 logits = model.forward_incremental(seq)
                 target = seq[1:]
 
                 loss = F.cross_entropy(logits, target, ignore_index=tokenizer.eot_token)
                 loss.backward()
-                total_loss += loss.item()
+                
+                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+                optimizer.step()
+                optimizer.zero_grad()
+                
+                total_train_loss += loss.item()
                 steps += 1
                 pbar.update(1)
                 pbar.set_postfix(loss=f"{loss.item():.4f}")
-
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        optimizer.zero_grad()
+        
         scheduler.step()
+        train_loss = total_train_loss / STEPS_PER_EPOCH
 
-        print(f"Epoch {epoch+1:2d}  Avg loss: {total_loss/steps:.4f}  LR: {scheduler.get_last_lr()[0]:.6f}")
+        # Validation
+        val_ppl, val_loss = validate()
+        print(f"Epoch {epoch+1:2d} | Train Loss: {train_loss:.4f} | "
+              f"Val Loss: {val_loss:.4f} | Val PPL: {val_ppl:.2f} | LR: {scheduler.get_last_lr()[0]:.6f}")
+
+        if val_ppl < best_val_ppl:
+            best_val_ppl = val_ppl
+            save_path = f"best_model_valppl_{val_ppl:.2f}.pt"
+            torch.save(model.state_dict(), save_path)
+            print(f"  → New best model saved: {save_path}")
+
         save_checkpoint()
 
     print("Training finished.")
+
+# ────────────────────────────────────────────────────────────────
+#  Final Test after training
+# ────────────────────────────────────────────────────────────────
+def run_final_tests():
+    print("\n" + "="*100)
+    print("Final Test Results after training")
+    print("="*100)
+
+    val_ppl, val_loss = validate()
+    print(f"Final Validation Perplexity: {val_ppl:.2f}  (lower = better)")
+    print(f"Final Validation Loss: {val_loss:.4f}\n")
+
+    test_prompts = [
+        "Once upon a time there was a little girl who loved to",
+        "In a dark forest lived an old wizard who could",
+        "The brave knight took his sword and went to",
+        "A small dragon woke up from a long sleep and",
+        "Deep under the sea there lived a curious mermaid who"
+    ]
+
+    for i, prompt in enumerate(test_prompts, 1):
+        print(f"\nTest {i}/{len(test_prompts)}")
+        print(f"Prompt: {prompt!r}")
+        generated = beam_search_generate(prompt)
+        print(f"Generated:\n{generated}\n{'-'*80}")
 
 # ────────────────────────────────────────────────────────────────
 #  Generation with real tokenizer
@@ -453,6 +524,7 @@ if __name__ == "__main__":
     parser.add_argument("--prompt", type=str, default="Once upon a time there was a little girl who loved to", help="Prompt for generation")
     parser.add_argument("--beam", action="store_true", help="Use beam search for generation")
     parser.add_argument("--beam_width", type=int, default=BEAM_WIDTH, help="Beam width")
+    parser.add_argument("--test", action="store_true", help="Run final test suite")
     args = parser.parse_args()
 
     current_mode = args.mode
@@ -467,9 +539,18 @@ if __name__ == "__main__":
 
     if args.train:
         train()
+        run_final_tests()
 
-    if args.generate or not args.train:
+    if args.test and not args.train:
+        run_final_tests()
+
+    if args.generate or (not args.train and not args.test):
         print("\n" + "="*90)
         print(f"Test prompt: {args.prompt!r}")
-        generated = generate(args.prompt)
+        if args.beam:
+            print(f"Generating with Beam Search (width={args.beam_width})...")
+            generated = beam_search_generate(args.prompt, beam_width=args.beam_width)
+        else:
+            print("Generating with Greedy Decoding...")
+            generated = generate(args.prompt)
         print(f"Generated continuation:\n{generated}")

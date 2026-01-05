@@ -53,6 +53,12 @@ Beyond greedy decoding, Lightwave now supports **Beam Search**:
 - Corrects potential local errors by exploring multiple high-probability paths simultaneously.
 - Configurable via `--beam` and `--beam_width`.
 
+### 4. Validation Perplexity Tracking
+The model now includes automated performance monitoring:
+- **Dataset Split**: 95/5 train/val split is performed automatically.
+- **Perplexity ($PPL$):** Tracked after each epoch on held-out validation data ($PPL = e^{loss}$).
+- **Best Model Saving**: Automatically saves the model with the lowest validation perplexity as `best_model_valppl_*.pt`.
+
 ---
 
 ## Command Line Interface (CLI)
@@ -70,6 +76,7 @@ Beyond greedy decoding, Lightwave now supports **Beam Search**:
 | `--prompt "[TEXT]"` | Prompt for generation | (TinyStories intro) |
 | `--beam` | Use beam search decoding | False |
 | `--beam_width [N]` | Number of beams for search | 5 |
+| `--test` | Run final validation & tests | False |
 
 ### Example Commands
 - **Train Depth-8 Wave Model**: `python llm_light.py --train --mode wave --layers 8`
@@ -82,5 +89,6 @@ Beyond greedy decoding, Lightwave now supports **Beam Search**:
 The script automatically saves two files after each epoch:
 - `model.pth`: The latest state for easy resuming.
 - `model_[mode]_[timestamp].pth`: A versioned archive for history tracking and comparison.
+- `best_model_valppl_*.pt`: The model state that achieved the lowest validation perplexity during training.
 
 The `load_checkpoint` logic automatically detects the saved mode and layer count, re-configuring the script to match the saved architecture perfectly.
