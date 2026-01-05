@@ -18,6 +18,62 @@ def mish(x):
     """Mish activation function: x * tanh(softplus(x))"""
     return x * torch.tanh(F.softplus(x))
 
+def simulate_quantization(weight, bits=4):
+    """Simulate symmetric linear quantization during training"""
+    if bits is None:
+        return weight
+    qmin = -(2**(bits - 1))
+    qmax = 2**(bits - 1) - 1
+    
+    # Scale based on max absolute value
+    max_val = torch.max(torch.abs(weight))
+    if max_val == 0:
+        return weight
+    
+    scale = max_val / qmax
+    q_weight = torch.round(weight / (scale + 1e-8))
+    q_weight = torch.clamp(q_weight, qmin, qmax)
+    return q_weight * scale
+
+class LoRALinear(torch.nn.Module):
+    """Linear layer with Low-Rank Adaptation (LoRA) and simulated quantization"""
+    def __init__(self, in_features, out_features, rank=4, alpha=16, use_lora=False, quant_bits=None):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rank = rank
+        self.alpha = alpha
+        self.use_lora = use_lora
+        self.quant_bits = quant_bits
+        
+        # Base weights (frozen if use_lora is True)
+        self.weight = torch.nn.Parameter(torch.randn(out_features, in_features) / math.sqrt(in_features))
+        self.bias = torch.nn.Parameter(torch.zeros(out_features))
+        
+        if use_lora:
+            # Low-rank matrices: B (out x rank), A (rank x in)
+            self.lora_A = torch.nn.Parameter(torch.randn(rank, in_features) / math.sqrt(in_features))
+            self.lora_B = torch.nn.Parameter(torch.zeros(out_features, rank))
+            self.scaling = alpha / rank
+        else:
+            self.register_parameter('lora_A', None)
+            self.register_parameter('lora_B', None)
+
+    def forward(self, x):
+        # 1. Simulate quantization on weights
+        w = simulate_quantization(self.weight, bits=self.quant_bits)
+        b = simulate_quantization(self.bias, bits=self.quant_bits)
+        
+        # 2. Main linear pass
+        out = F.linear(x, w, b)
+        
+        # 3. LoRA path: out += (x @ A.T @ B.T) * scaling
+        if self.use_lora and self.lora_A is not None:
+            lora_out = (x @ self.lora_A.t()) @ self.lora_B.t()
+            out = out + lora_out * self.scaling
+            
+        return out
+
 # ────────────────────────────────────────────────────────────────
 #  Hyperparameters
 # ────────────────────────────────────────────────────────────────
@@ -110,17 +166,17 @@ class RelativePositionalBias(torch.nn.Module):
         return self.bias[idx]
 
 class MultiHeadModulator(torch.nn.Module):
-    def __init__(self, dim=EMBED_DIM, heads=H):
+    def __init__(self, dim=EMBED_DIM, heads=H, use_lora=False, lora_rank=4, quant_bits=None):
         super().__init__()
         self.dim = dim
         self.heads = heads
         self.head_dim = dim // heads
         
         # Projections for Q, K, V
-        self.q_proj = torch.nn.Linear(dim * 2, dim * 2)
-        self.k_proj = torch.nn.Linear(dim * 2, dim * 2)
-        self.v_proj = torch.nn.Linear(dim * 2, dim * 2)
-        self.out_proj = torch.nn.Linear(dim * 2, dim * 2)
+        self.q_proj = LoRALinear(dim * 2, dim * 2, rank=lora_rank, use_lora=use_lora, quant_bits=quant_bits)
+        self.k_proj = LoRALinear(dim * 2, dim * 2, rank=lora_rank, use_lora=use_lora, quant_bits=quant_bits)
+        self.v_proj = LoRALinear(dim * 2, dim * 2, rank=lora_rank, use_lora=use_lora, quant_bits=quant_bits)
+        self.out_proj = LoRALinear(dim * 2, dim * 2, rank=lora_rank, use_lora=use_lora, quant_bits=quant_bits)
         
         self.rel_bias = RelativePositionalBias(dim=dim)
 
@@ -176,9 +232,9 @@ class MultiHeadModulator(torch.nn.Module):
         return torch.view_as_complex(out_proj.view(self.dim, 2))
 
 class ReadoutHead(torch.nn.Module):
-    def __init__(self, dim=EMBED_DIM, vocab_size=VOCAB_SIZE):
+    def __init__(self, dim=EMBED_DIM, vocab_size=VOCAB_SIZE, use_lora=False, quant_bits=None):
         super().__init__()
-        self.proj = torch.nn.Linear(dim * 2, vocab_size)
+        self.proj = LoRALinear(dim * 2, vocab_size, use_lora=use_lora, quant_bits=quant_bits)
 
     def forward(self, z):
         # z: [..., dim] complex
@@ -209,11 +265,11 @@ class QuantumWaveModulator(torch.nn.Module):
 
 class PhotonicInterferenceLayer(torch.nn.Module):
     """One full interference layer/block"""
-    def __init__(self, mode="neural"):
+    def __init__(self, mode="neural", use_lora=False, lora_rank=4, quant_bits=None):
         super().__init__()
         self.mode = mode
         if mode == "neural":
-            self.modulator = MultiHeadModulator()
+            self.modulator = MultiHeadModulator(use_lora=use_lora, lora_rank=lora_rank, quant_bits=quant_bits)
         else:
             self.modulator = QuantumWaveModulator()
         self.coupling = torch.nn.Parameter(torch.tensor(INITIAL_COUPLING))
@@ -247,13 +303,14 @@ class PhotonicInterferenceLayer(torch.nn.Module):
         return z_new
 
 class MultiLayerPhotonicNN(torch.nn.Module):
-    def __init__(self, mode="neural", num_layers=4):
+    def __init__(self, num_layers=LAYERS_DEFAULT, mode="neural", use_lora=False, lora_rank=4, quant_bits=None):
         super().__init__()
-        self.mode = mode
         self.token_embed = TokenEmbedding(VOCAB_SIZE)
         self.pos_bias = RelativePositionalBias()
-        self.layers = torch.nn.ModuleList([PhotonicInterferenceLayer(mode=mode) for _ in range(num_layers)])
-        self.readout = ReadoutHead()
+        self.layers = torch.nn.ModuleList([
+            PhotonicInterferenceLayer(mode=mode, use_lora=use_lora, lora_rank=lora_rank, quant_bits=quant_bits) for _ in range(num_layers)
+        ])
+        self.readout = ReadoutHead(use_lora=use_lora, quant_bits=quant_bits)
 
     def forward_incremental(self, token_ids):
         seq_len = token_ids.size(0)
@@ -278,10 +335,11 @@ optimizer = None
 scheduler = None
 current_mode = "neural" # default
 
-def init_model(mode="neural", num_layers=4):
+def init_model(mode="neural", num_layers=LAYERS_DEFAULT, use_lora=False, lora_rank=4, quant_bits=None):
     global model, optimizer, scheduler, current_mode
-    current_mode = mode
-    model = MultiLayerPhotonicNN(mode=mode, num_layers=num_layers).to(DEVICE)
+    current_mode = mode # Keep current_mode updated globally
+    model = MultiLayerPhotonicNN(num_layers=num_layers, mode=mode, use_lora=use_lora, lora_rank=lora_rank, quant_bits=quant_bits).to(DEVICE)
+    print(f"Photonic Model Initialized (Mode: {mode}, Layers: {num_layers}, LoRA: {use_lora} (rank {lora_rank}), Quant: {quant_bits}-bit)")
     optimizer = optim.Adam(model.parameters(), lr=LR)
     scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=LR*0.05)
 
@@ -349,15 +407,32 @@ def validate():
 #  Training loop (same structure, real chunks)
 # ────────────────────────────────────────────────────────────────
 def train():
-    print(f"Training started on TinyStories | Val steps: {VAL_STEPS}")
+    print(f"Long training | Max epochs: {EPOCHS} | Steps per epoch: {STEPS_PER_EPOCH}")
     best_val_ppl = float('inf')
 
-    for epoch in range(EPOCHS):
+    # If LoRA is enabled, freeze base weights and only train adapters
+    # Note: We still keep 'coupling' and 'norm_scale' trainable by default 
+    # as they are small and central to the photonic mechanism.
+    if any(p.requires_grad and "lora_" in n for n, p in model.named_parameters()):
+        print("LoRA training detected: Freezing non-LoRA parameters (except couplings/norms)...")
+        for name, param in model.named_parameters():
+            if "lora_" in name or "coupling" in name or "norm_scale" in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+        
+        # Re-initialize optimizer for trainable params only
+        global optimizer, scheduler
+        optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=LR)
+        # Re-initialize scheduler to point to the correct optimizer
+        scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=LR*0.05)
+
+    for epoch in range(1, EPOCHS + 1):
         model.train()
         total_train_loss = 0.0
         steps = 0
 
-        with tqdm(total=STEPS_PER_EPOCH, desc=f"Epoch {epoch+1}/{EPOCHS} Train") as pbar:
+        with tqdm(total=STEPS_PER_EPOCH, desc=f"Epoch {epoch}/{EPOCHS} Train") as pbar:
             while steps < STEPS_PER_EPOCH:
                 seq = get_random_chunk(train_text)
                 logits = model.forward_incremental(seq)
@@ -380,7 +455,7 @@ def train():
 
         # Validation
         val_ppl, val_loss = validate()
-        print(f"Epoch {epoch+1:2d} | Train Loss: {train_loss:.4f} | "
+        print(f"Epoch {epoch:2d} | Train Loss: {train_loss:.4f} | "
               f"Val Loss: {val_loss:.4f} | Val PPL: {val_ppl:.2f} | LR: {scheduler.get_last_lr()[0]:.6f}")
 
         if val_ppl < best_val_ppl:
@@ -683,6 +758,9 @@ if __name__ == "__main__":
     parser.add_argument("--beam_width", type=int, default=BEAM_WIDTH, help="Beam width")
     parser.add_argument("--test", action="store_true", help="Run final test suite")
     parser.add_argument("--rl_train", action="store_true", help="Start RLVR self-improvement training")
+    parser.add_argument("--lora", action="store_true", help="Use Low-Rank Adaptation (LoRA) for fine-tuning")
+    parser.add_argument("--lora_rank", type=int, default=4, help="LoRA rank")
+    parser.add_argument("--quant", action="store_true", help="Enable simulated 4-bit quantization")
     args = parser.parse_args()
 
     current_mode = args.mode
@@ -690,7 +768,8 @@ if __name__ == "__main__":
     STEPS_PER_EPOCH = args.steps
     
     # Initialize the model correctly before potentially loading
-    init_model(mode=current_mode, num_layers=args.layers)
+    quant_bits = 4 if args.quant else None
+    init_model(mode=current_mode, num_layers=args.layers, use_lora=args.lora, lora_rank=args.lora_rank, quant_bits=quant_bits)
 
     if args.load:
         load_checkpoint(args.checkpoint)

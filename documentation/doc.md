@@ -78,6 +78,11 @@ Lightwave supports post-training self-improvement via **Reinforcement Learning f
 - **Sparse Optimization**: During RL fine-tuning, only the modulator parameters ($\alpha$ and multi-head projections) are updated, preserving the foundational linguistic knowledge while refining the attention policy.
 - **Scaling**: Allows the model to improve on specific tasks or styles without massive additional Supervised Fine-Tuning (SFT) data.
 
+### 6. Parameter-Efficient Techniques (PEFT)
+To scale for photonic hardware with memory constraints, Lightwave implements:
+- **LoRA (Low-Rank Adaptation)**: Injected into all `MultiHeadModulator` projections. Freezes base weights and trains rank=$k$ matrices to adapt the interference patterns.
+- **Simulated 4-bit Quantization**: Bakes in symmetric linear quantization approximations during the forward pass, preparing the model for low-precision optical substrates.
+
 ---
 
 ## Command Line Interface (CLI)
@@ -97,6 +102,9 @@ Lightwave supports post-training self-improvement via **Reinforcement Learning f
 | `--beam_width [N]` | Number of beams for search | 5 |
 | `--test` | Run final validation & tests | False |
 | `--rl_train` | Start RLVR fine-tuning loop | False |
+| `--lora` | Enable Low-Rank Adaptation | False |
+| `--lora_rank [N]` | Rank of LoRA adapters | 4 |
+| `--quant` | Enable 4-bit quantization simulation | False |
 | `--M [N]` | Number of internal evolution steps per layer | 8 |
 
 ### Example Commands
@@ -115,6 +123,14 @@ Lightwave supports post-training self-improvement via **Reinforcement Learning f
   > [!NOTE]
   > Use this to verify the reward logic and policy gradient update without a full fine-tuning run.
 - **Standard RL Fine-tuning**: `python llm_light.py --rl_train --load --checkpoint model.pth --steps 100`
+
+#### Efficiency & Scaling
+- **LoRA Fine-tuning**: `python llm_light.py --train --lora --lora_rank 8 --load`
+  > [!TIP]
+  > This is the recommended way to adapt a pre-trained model to new data with minimal VRAM.
+- **Quantization-Aware Training**: `python llm_light.py --train --quant`
+  > [!NOTE]
+  > Simulates 4-bit weights to prepare the model for specialized photonic inference engines.
 
 #### Generation
 - **Standard (Greedy)**: `python llm_light.py --generate --prompt "The princess found a"`
