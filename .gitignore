@@ -5,7 +5,7 @@
 
 # Data
 *.txt
-TinyStories-train.txt
+tinyStories-train.txt
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
