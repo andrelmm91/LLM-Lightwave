@@ -131,6 +131,9 @@ To scale for photonic hardware with memory constraints, Lightwave implements:
 - **Quantization-Aware Training**: `python llm_light.py --train --quant`
   > [!NOTE]
   > Simulates 4-bit weights to prepare the model for specialized photonic inference engines.
+- **Wave LoRA RLVR**: `python llm_light.py --train --mode wave --layers 12 --lora --quant --rl_train --steps 100`
+  > [!TIP]
+  > This is the recommended way to adapt a pre-trained model to new data with minimal VRAM.
 
 #### Generation
 - **Standard (Greedy)**: `python llm_light.py --generate --prompt "The princess found a"`

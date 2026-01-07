@@ -257,11 +257,11 @@ class QuantumWaveModulator(torch.nn.Module):
     def forward(self, curr_pos, z_curr, z_past, coupling=INITIAL_COUPLING):
         if z_past.numel() == 0:
             return torch.zeros_like(z_curr)
-        u_prev = z_past[-1, 0]
-        v_curr = z_curr[1]
-        state = torch.stack([u_prev, v_curr])
-        out = (self.coin * coupling) @ state
-        return out
+        u_prev = z_past[-1] # [dim]
+        v_curr = z_curr     # [dim]
+        state = torch.stack([u_prev, v_curr], dim=0) # [2, dim]
+        out = (self.coin * coupling) @ state # [2, dim]
+        return out[0] # [dim]
 
 class PhotonicInterferenceLayer(torch.nn.Module):
     """One full interference layer/block"""
