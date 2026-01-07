@@ -17,6 +17,9 @@ Tokens are projected into a complex space ($a + bi$) with an increased dimension
 Lightwave utilizes the **Mish** activation function ($x \cdot \tanh(\text{softplus}(x))$) applied independently to the real and imaginary components.
 - **Smooth Gradient**: Unlike `tanh`, Mish avoids early saturation, preserving gradient information during deep propagation.
 - **Dynamic Response**: Provides a more nuanced non-linear mapping for photonic field interactions.
+- **Unitary Efficiency**: Extremely low-parameter "Wave" mode using Quantum Random Walks.
+- **Deep Adaptive Interference**: Multi-stage coupling that learns unique field dynamics for every evolution step.
+- **Dynamic Evolution**: A stateful, temporal architecture that treats memory as a field.
 
 ### 3. Multi-Head Modulator (Attention Upgrade)
 Traditional Self-Attention has $O(N^2)$ complexity. Lightwave uses an optimized **Complex Dot-Product Attention** mechanism:
@@ -44,7 +47,7 @@ The model uses a **Deep Cascaded Architecture** to simulate multiple stages of l
 Each layer implements a physical interaction stage:
 1.  **Interference**: The current state interacts with the global historical field.
 2.  **Modulation**: Uses either a Neural Modulator or a Fixed Quantum Wave (QRW).
-3.  **Learnable Coupling**: The coupling strength is a per-layer learnable parameter ($\alpha$), initialized at 0.12, allowing the model to adaptively tune interference levels.
+3.  **Multi-Stage Adaptive Coupling**: The coupling strength is now a **learnable vector** of size $M$. Each internal evolution step has its own unique, learned coupling strength ($\alpha_m$), initialized at 0.5, allowing the model to adaptively tune interference profiles across the temporal depth.
 4.  **Non-Linearity**: Applies **Mish** activation (simulating advanced photonic saturable absorbers).
 5.  **Normalization**: Uses **Complex LayerNorm** (independent LayerNorm on real/imag) followed by a learnable `norm_scale` to maintain field stability.
 

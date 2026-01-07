@@ -79,7 +79,7 @@ class LoRALinear(torch.nn.Module):
 # ────────────────────────────────────────────────────────────────
 M = 8                # Internal evolution steps (temporal depth) per layer
 H = 4                # Number of parallel attention heads in the modulator
-INITIAL_COUPLING = 0.12      # Initial coupling strength between field and candidate
+INITIAL_COUPLING = 0.5      # Initial coupling strength between field and candidate
 SEQ_LEN = 128        # Context window length for training samples
 EPOCHS = 15          # Total training passes over the dataset
 STEPS_PER_EPOCH = 200 # number of weight updates per epoch
@@ -243,24 +243,39 @@ class ReadoutHead(torch.nn.Module):
 
 class QuantumWaveModulator(torch.nn.Module):
     """
-    Fixed Unitary Modulator based on Discrete-time Quantum Random Walk.
-    Matrix: 1/sqrt(2) * [[1, i], [i, 1]]
+    Enhanced Unitary Modulator based on Discrete-time Quantum Random Walk.
+    Features learnable phase shifts for increased expressivity.
     """
-    def __init__(self):
+    def __init__(self, dim=EMBED_DIM):
         super().__init__()
-        # Coin matrix
+        # Coin matrix (Fixed Unitary)
         self.register_buffer("coin", torch.tensor([
             [1.0 + 0.0j, 0.0 + 1.0j],
             [0.0 + 1.0j, 1.0 + 0.0j]
         ], dtype=torch.complex64) / (2.0**0.5))
+        
+        # Learnable phase shifts (vectors)
+        self.phase_u = torch.nn.Parameter(torch.zeros(dim))
+        self.phase_v = torch.nn.Parameter(torch.zeros(dim))
 
-    def forward(self, curr_pos, z_curr, z_past, coupling=INITIAL_COUPLING):
-        if z_past.numel() == 0:
+    def forward(self, curr_pos, z_curr, z_past_stacked, coupling=INITIAL_COUPLING):
+        if z_past_stacked is None:
             return torch.zeros_like(z_curr)
-        u_prev = z_past[-1] # [dim]
-        v_curr = z_curr     # [dim]
+            
+        # 1. Capture the 'previous' state from the historical field
+        # In a multi-layer cascade, we often look at the immediate predecessor
+        u_prev = z_past_stacked[-1] # [dim]
+        v_curr = z_curr             # [dim]
+        
+        # 2. Apply learnable phase rotations before interference
+        # exp(i * phase)
+        u_prev = u_prev * torch.exp(1j * self.phase_u)
+        v_curr = v_curr * torch.exp(1j * self.phase_v)
+        
+        # 3. Apply Unitary Coin (Interference)
         state = torch.stack([u_prev, v_curr], dim=0) # [2, dim]
         out = (self.coin * coupling) @ state # [2, dim]
+        
         return out[0] # [dim]
 
 class PhotonicInterferenceLayer(torch.nn.Module):
@@ -271,27 +286,29 @@ class PhotonicInterferenceLayer(torch.nn.Module):
         if mode == "neural":
             self.modulator = MultiHeadModulator(use_lora=use_lora, lora_rank=lora_rank, quant_bits=quant_bits)
         else:
-            self.modulator = QuantumWaveModulator()
-        self.coupling = torch.nn.Parameter(torch.tensor(INITIAL_COUPLING))
+            self.modulator = QuantumWaveModulator(dim=EMBED_DIM)
+        self.coupling = torch.nn.Parameter(torch.full((M,), INITIAL_COUPLING))
         self.norm_scale = torch.nn.Parameter(torch.tensor(1.0))
 
     def forward(self, candidate, z_cache, pos, num_steps=M):
         z_new = candidate
         
+        # Optimization: stack history once per token, not M times
+        z_past_stacked = torch.stack(z_cache) if z_cache else None
+        
         # Internal temporal evolution loop
-        for _ in range(num_steps):
-            if not z_cache:
-                # First token: no interference, just modulation? 
-                # Or we can skip loop. Let's keep it simple:
+        for m in range(num_steps):
+            if z_past_stacked is None:
+                # First token: no interference
                 pass
             else:
-                z_past = torch.stack(z_cache)
+                c = self.coupling[m] # Multi-stage adaptive coupling
                 if self.mode == "wave":
-                    mod_factor = self.modulator(pos, z_new, z_past, coupling=self.coupling)
-                    z_new = mod_factor + (1 - self.coupling) * z_new
+                    mod_factor = self.modulator(pos, z_new, z_past_stacked, coupling=c)
+                    z_new = mod_factor + (1 - c) * z_new
                 else:
-                    mod_factor = self.modulator(pos, z_new, z_past)
-                    z_new = z_new + self.coupling * mod_factor
+                    mod_factor = self.modulator(pos, z_new, z_past_stacked)
+                    z_new = z_new + c * mod_factor
 
             # Photonic-style non-linearity (Mish) and normalization
             z_new = mish(z_new.real) + 1j * mish(z_new.imag)

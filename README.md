@@ -16,6 +16,7 @@ Traditional Large Language Models (LLMs) treat tokens as static points in a real
 Built on the cutting edge of **Complex-Valued Neural Networks (CVNNs)**, Lightwave simulates the behavior of lightwaves as they cascade through interference layers, allowing for:
 - **Phase-Aware Context**: Naturally encoding sequence timing and relational depth.
 - **Unitary Efficiency**: Extremely low-parameter "Wave" mode using Quantum Random Walks.
+- **Deep Adaptive Interference**: Multi-stage coupling that learns unique field dynamics for every evolution step.
 - **Dynamic Evolution**: A stateful, temporal architecture that treats memory as a field.
 
 ---
