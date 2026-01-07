@@ -24,8 +24,9 @@ Built on the cutting edge of **Complex-Valued Neural Networks (CVNNs)**, Lightwa
 ## ✨ Key Features
 
 ### 🧠 Complex-Valued Core
-*   **16-Dimensional $\mathbb{C}$ Space**: High-fidelity embeddings (8 real + 8 imaginary) for rich feature representation.
-*   **Mish-Complex Activation**: Non-linear mapping that preserves gradient flow across deep cascades.
+*   **16-Dimensional $\mathbb{C}$ Space**: High-fidelity embeddings for rich feature representation.
+*   **Mish-Complex Activation**: Non-linear mapping preserving phase information across deep cascades.
+*   **Amplitude & Phase Modulation**: Dual-domain learning that tunes field intensity and rotation for precise interference.
 *   **Complex LayerNorm**: Independent normalization of magnitude and phase for maximum stability.
 
 ### ⚡ Advanced Architectures

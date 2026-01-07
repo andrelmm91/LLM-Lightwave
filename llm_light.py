@@ -112,8 +112,8 @@ def get_random_chunk(text, length=SEQ_LEN):
 # ────────────────────────────────────────────────────────────────
 #  Load TinyStories (download manually from HF)
 # ────────────────────────────────────────────────────────────────
-# DATA_PATH = "debug_data.txt"  # for quick testing
-DATA_PATH = "tinyStories-train.txt"  # ← place downloaded file here
+# DATA_PATH = "./training dataset/debug_data.txt"  # for quick testing
+DATA_PATH = "./training dataset/tinyStories-train.txt"  # ← place downloaded file here
 
 if not os.path.exists(DATA_PATH):
     raise FileNotFoundError(
@@ -379,10 +379,14 @@ def save_checkpoint(path=None):
     }
     
     torch.save(checkpoint, "model.pth")
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-    dynamic_path = f"model_{current_mode}_{timestamp}.pth"
-    torch.save(checkpoint, dynamic_path)
-    print(f"Checkpoints saved: model.pth and {dynamic_path}")
+    if path is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+        dynamic_path = f"model_{current_mode}_{timestamp}.pth"
+        torch.save(checkpoint, dynamic_path)
+        print(f"Checkpoints saved: model.pth and {dynamic_path}")
+    else:
+        torch.save(checkpoint, path)
+        print(f"Checkpoint saved: {path}")
 
 def load_checkpoint(path="model.pth"):
     global current_mode, optimizer, scheduler, model
@@ -392,35 +396,22 @@ def load_checkpoint(path="model.pth"):
     
     checkpoint = torch.load(path, map_location=DEVICE, weights_only=False)
     
-    saved_mode = checkpoint.get('mode', 'neural')
-    saved_layers = checkpoint.get('num_layers', 4)
-    saved_lora = checkpoint.get('use_lora')
-    saved_rank = checkpoint.get('lora_rank', 4)
-    saved_quant = checkpoint.get('quant_bits', None)
-
-    # Heuristic: if use_lora is missing, check state_dict keys
-    if saved_lora is None:
+    # Handle both full checkpoints and raw state dicts
+    if 'model_state' in checkpoint:
         model_state = checkpoint['model_state']
-        saved_lora = any("lora_" in k for k in model_state.keys())
-        if saved_lora:
-            # Try to infer rank from a lora_A parameter
-            for k, v in model_state.items():
-                if "lora_A" in k:
-                    saved_rank = v.size(0)
-                    break
-
-    # Re-initialize model to match saved architecture if necessary
-    arch_mismatch = (saved_mode != model.mode or 
-                     saved_layers != model.num_layers or 
-                     saved_lora != model.use_lora or 
-                     saved_rank != model.lora_rank or 
-                     saved_quant != model.quant_bits)
-
-    if arch_mismatch:
-        print(f"Switching architecture to match checkpoint: Mode={saved_mode}, Layers={saved_layers}, LoRA={saved_lora}, Rank={saved_rank}, Quant={saved_quant}")
-        init_model(mode=saved_mode, num_layers=saved_layers, use_lora=saved_lora, lora_rank=saved_rank, quant_bits=saved_quant)
-
-    model.load_state_dict(checkpoint['model_state'])
+        saved_mode = checkpoint.get('mode', 'neural')
+        saved_layers = checkpoint.get('num_layers', 4)
+        saved_lora = checkpoint.get('use_lora')
+        saved_rank = checkpoint.get('lora_rank', 4)
+        saved_quant = checkpoint.get('quant_bits', None)
+    else:
+        # Assume it's a raw state dict
+        model_state = checkpoint
+        saved_mode = model.mode
+        saved_layers = model.num_layers
+        saved_lora = model.use_lora
+        saved_rank = model.lora_rank
+        saved_quant = model.quant_bits
     
     # If LoRA was active, we must re-filter the optimizer before loading its state
     if saved_lora:
@@ -433,8 +424,10 @@ def load_checkpoint(path="model.pth"):
         optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=LR)
         scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=LR*0.05)
 
-    optimizer.load_state_dict(checkpoint['optimizer_state'])
-    scheduler.load_state_dict(checkpoint['scheduler_state'])
+    if 'optimizer_state' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state'])
+    if 'scheduler_state' in checkpoint:
+        scheduler.load_state_dict(checkpoint['scheduler_state'])
     
     print(f"Checkpoint loaded: {path} (Mode: {saved_mode}, Layers: {saved_layers})")
     return True
@@ -518,7 +511,8 @@ def train():
         if val_ppl < best_val_ppl:
             best_val_ppl = val_ppl
             save_path = f"best_model_valppl_{val_ppl:.2f}.pt"
-            torch.save(model.state_dict(), save_path)
+            # Use the unified save_checkpoint logic to include metadata
+            save_checkpoint(path=save_path)
             print(f"  → New best model saved: {save_path}")
 
         save_checkpoint()

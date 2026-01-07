@@ -53,6 +53,11 @@ Each layer implements a physical interaction stage:
     -   **Layer Adaptive**: Every cascaded layer maintains its own independent coupling profile, allowing the model to learn different interference logic at different depths.
 4.  **Non-Linearity**: Applies **Mish** activation (simulating advanced photonic saturable absorbers).
 5.  **Normalization**: Uses **Complex LayerNorm** (independent LayerNorm on real/imag) followed by a learnable `norm_scale` to maintain field stability.
+6.  **Modulation Dynamics: Amplitude & Phase**: The architecture performs spatio-temporal modulation to learn linguistic patterns:
+    -   **Amplitude Modulation**: Managed by the **Triple-Adaptive Coupling**. The model learns an optimal mixing ratio ($\alpha$) for every $M$ step and Layer, gating the signal strength between the modulated candidate and the existing field.
+    -   **Phase Modulation**:
+        -   *Wave Mode*: Uses learned phase vectors ($\phi_u, \phi_v$) to perform rotations in the complex plane before interference, allowing for constructive/destructive alignment.
+        -   *Neural Mode*: Learned complex weights naturally optimize phase rotations and magnitude scaling simultaneously.
 
 ---
 
