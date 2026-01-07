@@ -139,7 +139,7 @@ To scale for photonic hardware with memory constraints, Lightwave implements:
 - **Standard (Greedy)**: `python llm_light.py --generate --prompt "The princess found a"`
 - **Beam Search (Default Width 5)**: `python llm_light.py --generate --beam --prompt "In a small house"`
 - **Precision Beam Search**: `python llm_light.py --generate --beam --beam_width 10 --prompt "Once upon a time"`
-- **Load Best Model & Generate**: `python llm_light.py --generate --load --checkpoint best_model_valppl_15.39.pt --beam`
+- **Load Best Model & Generate**: `python llm_light.py --generate --load --checkpoint model.pth --beam --prompt "Once upon a time"`
 
 #### Evaluation & Testing
 - **Standalone Evaluation**: `python llm_light.py --test --load --checkpoint model.pth`
