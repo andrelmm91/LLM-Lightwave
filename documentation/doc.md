@@ -47,7 +47,10 @@ The model uses a **Deep Cascaded Architecture** to simulate multiple stages of l
 Each layer implements a physical interaction stage:
 1.  **Interference**: The current state interacts with the global historical field.
 2.  **Modulation**: Uses either a Neural Modulator or a Fixed Quantum Wave (QRW).
-3.  **Multi-Stage Adaptive Coupling**: The coupling strength is now a **learnable vector** of size $M$. Each internal evolution step has its own unique, learned coupling strength ($\alpha_m$), initialized at 0.5, allowing the model to adaptively tune interference profiles across the temporal depth.
+3.  **Triple-Adaptive Coupling**: The coupling strength is optimized across **three dimensions**:
+    -   **Epoch Adaptive**: Learned throughout training via backpropagation.
+    -   **Step Adaptive**: Each of the $M$ evolution steps in a layer has its own unique coupling $\alpha_m$.
+    -   **Layer Adaptive**: Every cascaded layer maintains its own independent coupling profile, allowing the model to learn different interference logic at different depths.
 4.  **Non-Linearity**: Applies **Mish** activation (simulating advanced photonic saturable absorbers).
 5.  **Normalization**: Uses **Complex LayerNorm** (independent LayerNorm on real/imag) followed by a learnable `norm_scale` to maintain field stability.
 
