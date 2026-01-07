@@ -5,6 +5,7 @@
 
 # Data
 *.txt
+!requirements.txt
 tinyStories-train.txt
 
 # Byte-compiled / optimized / DLL files
