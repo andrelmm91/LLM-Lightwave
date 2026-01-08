@@ -301,7 +301,7 @@ class QuantumWaveModulator(torch.nn.Module):
         v_curr = z_curr             # [B, dim]
         
         # 2. Apply learnable phase rotations (with smart caching)
-        if not self._cache_valid:
+        if not self._cache_valid or self._phase_exp_u_cache is None:
             self._update_cache()
         
         u_prev = u_prev * self._phase_exp_u_cache[m]
