@@ -56,7 +56,7 @@ Each layer implements a physical interaction stage:
 6.  **Modulation Dynamics: Amplitude & Phase**: The architecture performs spatio-temporal modulation to learn linguistic patterns:
     -   **Amplitude Modulation**: Managed by the **Triple-Adaptive Coupling**. The model learns an optimal mixing ratio ($\alpha$) for every $M$ step and Layer, gating the signal strength between the modulated candidate and the existing field.
     -   **Phase Modulation**:
-        -   *Wave Mode*: Uses learned phase vectors ($\phi_u, \phi_v$) to perform rotations in the complex plane before interference, allowing for constructive/destructive alignment.
+        -   *Wave Mode*: Uses learned phase matrices ($\phi_u, \phi_v$) of shape $(M, dim)$ to perform unique rotations at every evolution step $m$, allowing for highly specific alignment before interference.
         -   *Neural Mode*: Learned complex weights naturally optimize phase rotations and magnitude scaling simultaneously.
 
 ---
@@ -67,9 +67,18 @@ Each layer implements a physical interaction stage:
 Learned multi-head interaction patterns. Best for capturing complex linguistic nuances.
 
 ### 2. Quantum Wave Modulator (`--mode wave`)
-Strictly follows a **Discrete-time Quantum Random Walk (QRW)**:
-$\begin{pmatrix} u \\ v \end{pmatrix}_{next} = \frac{1}{\sqrt{2}} \begin{pmatrix} 1 & i \\ i & 1 \end{pmatrix} \begin{pmatrix} u_{past} \\ v_{curr} \end{pmatrix}$
-This mode has **Zero** trainable parameters in the modulator core, relying on pure unitary interference.
+Strictly follows a **Discrete-time Quantum Random Walk (QRW)** using pure unitary interference with zero trainable parameters in the modulator core.
+
+#### Ballistic Spread (Spatial Shift)
+To simulate the physical propagation of lightwaves across different features, the model implements a **Ballistic Shift Operator** along the embedding dimension:
+- **Bi-Directional Flow**: The complex field is split into two components ($u$ and $v$).
+- **Shift Operation**: After interference, $u$ is shifted right ($i \to i+1$) and $v$ is shifted left ($i \to i-1$).
+- **Feature Mixing**: This allows information to travel across the "feature space" of a single token, drastically increasing the model's expressivity without adding parameters.
+
+#### Reflecting Boundary Conditions (RBC)
+To ensure the embedding size remains constant and energy is conserved:
+- **Reflections**: When a wave component reaches the edge of the embedding dimension ($0$ or $dim-1$), it is reflected back into the opposite direction.
+- **Size Invariance**: This mechanism keeps the "information field" contained within the original 16-dimensional complex space.
 
 ### 3. Beam Search Decoding
 Beyond greedy decoding, Lightwave now supports **Beam Search**:

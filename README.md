@@ -16,7 +16,7 @@ Traditional Large Language Models (LLMs) treat tokens as static points in a real
 Built on the cutting edge of **Complex-Valued Neural Networks (CVNNs)**, Lightwave simulates the behavior of lightwaves as they cascade through interference layers, allowing for:
 - **Phase-Aware Context**: Naturally encoding sequence timing and relational depth.
 - **Unitary Efficiency**: Extremely low-parameter "Wave" mode using Quantum Random Walks.
-- **Triple-Adaptive Interference**: Coupling that learns unique dynamics across **Epochs**, **Steps (M)**, and **Layers** simultaneously.
+*   **Triple-Adaptive Interference**: Coupling and Phase that learn unique dynamics across **Epochs**, **Steps (M)**, and **Layers** simultaneously.
 - **Dynamic Evolution**: A stateful, temporal architecture that treats memory as a field.
 
 ---
@@ -31,7 +31,7 @@ Built on the cutting edge of **Complex-Valued Neural Networks (CVNNs)**, Lightwa
 
 ### ⚡ Advanced Architectures
 *   **Multi-Head Modulator**: A Dot-Product Attention upgrade designed for the complex domain.
-*   **Quantum Wave Mode**: Run with **zero trainable parameters** in the modulator, utilizing pure unitary interference.
+*   **Quantum Wave Mode**: Run with **zero trainable parameters** in the modulator core, utilizing pure unitary interference with **Ballistic Spread** and **Reflecting Boundaries** for enhanced feature mixing.
 *   **Cascaded Interference**: Scalable multi-stage propagation (up to 12+ layers) for deep reasoning.
 
 ### 🛠️ Professional Tooling

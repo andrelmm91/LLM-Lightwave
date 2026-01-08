@@ -77,10 +77,11 @@ class LoRALinear(torch.nn.Module):
 # ────────────────────────────────────────────────────────────────
 #  Hyperparameters
 # ────────────────────────────────────────────────────────────────
-M = 8                # Internal evolution steps (temporal depth) per layer
 H = 4                # Number of parallel attention heads in the modulator
-INITIAL_COUPLING = 0.5      # Initial coupling strength between field and candidate
-SEQ_LEN = 128        # Context window length for training samples
+M = 6                # Internal evolution steps (temporal depth) per layer
+LAYERS_DEFAULT = 4   # Default number of cascaded interference stages
+INITIAL_COUPLING = 0.67      # Initial coupling strength between field and candidate
+SEQ_LEN = 32        # Context window length for training samples
 EPOCHS = 15          # Total training passes over the dataset
 STEPS_PER_EPOCH = 200 # number of weight updates per epoch
 LR = 4e-4            # Initial learning rate for Adam optimizer
@@ -88,7 +89,6 @@ EMBED_DIM = 16       # Total dimension: 8 real + 8 imaginary pairs (for 16D CVNN
 BEAM_WIDTH = 5       # Number of candidate beams maintained in beam search
 REL_MAX_DIST = 64    # Max relative distance for unique positional biases
 GRAD_CLIP = 1.0      # Maximum gradient norm to prevent explosions
-LAYERS_DEFAULT = 4   # Default number of cascaded interference stages
 VAL_STEPS = 100      # Number of validation chunks to sample each epoch
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -180,7 +180,7 @@ class MultiHeadModulator(torch.nn.Module):
         
         self.rel_bias = RelativePositionalBias(dim=dim)
 
-    def forward(self, curr_pos: int, z_curr, z_past):
+    def forward(self, curr_pos: int, z_curr, z_past, m: int = 0):
         if z_past.numel() == 0:
             return torch.zeros(self.dim, device=DEVICE, dtype=torch.complex64)
 
@@ -246,7 +246,7 @@ class QuantumWaveModulator(torch.nn.Module):
     Enhanced Unitary Modulator based on Discrete-time Quantum Random Walk.
     Features learnable phase shifts for increased expressivity.
     """
-    def __init__(self, dim=EMBED_DIM):
+    def __init__(self, m_steps=M, dim=EMBED_DIM):
         super().__init__()
         # Coin matrix (Fixed Unitary)
         self.register_buffer("coin", torch.tensor([
@@ -254,40 +254,54 @@ class QuantumWaveModulator(torch.nn.Module):
             [0.0 + 1.0j, 1.0 + 0.0j]
         ], dtype=torch.complex64) / (2.0**0.5))
         
-        # Learnable phase shifts (vectors)
-        self.phase_u = torch.nn.Parameter(torch.zeros(dim))
-        self.phase_v = torch.nn.Parameter(torch.zeros(dim))
+        # Learnable phase shifts (matrices of shape [M, dim])
+        self.phase_u = torch.nn.Parameter(torch.zeros(m_steps, dim))
+        self.phase_v = torch.nn.Parameter(torch.zeros(m_steps, dim))
 
-    def forward(self, curr_pos, z_curr, z_past_stacked, coupling=INITIAL_COUPLING):
+    def forward(self, curr_pos, z_curr, z_past_stacked, m: int = 0, coupling=INITIAL_COUPLING):
         if z_past_stacked is None:
             return torch.zeros_like(z_curr)
             
         # 1. Capture the 'previous' state from the historical field
-        # In a multi-layer cascade, we often look at the immediate predecessor
         u_prev = z_past_stacked[-1] # [dim]
         v_curr = z_curr             # [dim]
         
-        # 2. Apply learnable phase rotations before interference
-        # exp(i * phase)
-        u_prev = u_prev * torch.exp(1j * self.phase_u)
-        v_curr = v_curr * torch.exp(1j * self.phase_v)
+        # 2. Apply learnable phase rotations for the current step m
+        u_prev = u_prev * torch.exp(1j * self.phase_u[m])
+        v_curr = v_curr * torch.exp(1j * self.phase_v[m])
         
         # 3. Apply Unitary Coin (Interference)
+        # Using coupling to mix components
         state = torch.stack([u_prev, v_curr], dim=0) # [2, dim]
         out = (self.coin * coupling) @ state # [2, dim]
         
-        return out[0] # [dim]
+        # 4. Ballistic Shift with Reflecting Boundaries
+        u_prime = out[0]
+        v_prime = out[1]
+        
+        u_shifted = torch.zeros_like(u_prime)
+        v_shifted = torch.zeros_like(v_prime)
+        
+        # Right shift for U (forward moving), reflection at left boundary (0)
+        u_shifted[1:] = u_prime[:-1]
+        u_shifted[0] = v_prime[0] # Reflect V-left into U-right at index 0
+        
+        # Left shift for V (backward moving), reflection at right boundary (dim-1)
+        v_shifted[:-1] = v_prime[1:]
+        v_shifted[-1] = u_prime[-1] # Reflect U-right into V-left at index dim-1
+        
+        return u_shifted + v_shifted
 
 class PhotonicInterferenceLayer(torch.nn.Module):
     """One full interference layer/block"""
-    def __init__(self, mode="neural", use_lora=False, lora_rank=4, quant_bits=None):
+    def __init__(self, mode="neural", num_steps=M, use_lora=False, lora_rank=4, quant_bits=None):
         super().__init__()
         self.mode = mode
         if mode == "neural":
             self.modulator = MultiHeadModulator(use_lora=use_lora, lora_rank=lora_rank, quant_bits=quant_bits)
         else:
-            self.modulator = QuantumWaveModulator(dim=EMBED_DIM)
-        self.coupling = torch.nn.Parameter(torch.full((M,), INITIAL_COUPLING))
+            self.modulator = QuantumWaveModulator(m_steps=num_steps, dim=EMBED_DIM)
+        self.coupling = torch.nn.Parameter(torch.full((num_steps,), INITIAL_COUPLING))
         self.norm_scale = torch.nn.Parameter(torch.tensor(1.0))
 
     def forward(self, candidate, z_cache, pos, num_steps=M):
@@ -304,10 +318,10 @@ class PhotonicInterferenceLayer(torch.nn.Module):
             else:
                 c = self.coupling[m] # Multi-stage adaptive coupling
                 if self.mode == "wave":
-                    mod_factor = self.modulator(pos, z_new, z_past_stacked, coupling=c)
+                    mod_factor = self.modulator(pos, z_new, z_past_stacked, m=m, coupling=c)
                     z_new = mod_factor + (1 - c) * z_new
                 else:
-                    mod_factor = self.modulator(pos, z_new, z_past_stacked)
+                    mod_factor = self.modulator(pos, z_new, z_past_stacked, m=m)
                     z_new = z_new + c * mod_factor
 
             # Photonic-style non-linearity (Mish) and normalization
@@ -320,9 +334,10 @@ class PhotonicInterferenceLayer(torch.nn.Module):
         return z_new
 
 class MultiLayerPhotonicNN(torch.nn.Module):
-    def __init__(self, num_layers=LAYERS_DEFAULT, mode="neural", use_lora=False, lora_rank=4, quant_bits=None):
+    def __init__(self, num_layers=LAYERS_DEFAULT, num_steps=M, mode="neural", use_lora=False, lora_rank=4, quant_bits=None):
         super().__init__()
         self.num_layers = num_layers
+        self.num_steps = num_steps
         self.mode = mode
         self.use_lora = use_lora
         self.lora_rank = lora_rank
@@ -331,7 +346,7 @@ class MultiLayerPhotonicNN(torch.nn.Module):
         self.token_embed = TokenEmbedding(VOCAB_SIZE)
         self.pos_bias = RelativePositionalBias()
         self.layers = torch.nn.ModuleList([
-            PhotonicInterferenceLayer(mode=mode, use_lora=use_lora, lora_rank=lora_rank, quant_bits=quant_bits) for _ in range(num_layers)
+            PhotonicInterferenceLayer(mode=mode, num_steps=num_steps, use_lora=use_lora, lora_rank=lora_rank, quant_bits=quant_bits) for _ in range(num_layers)
         ])
         self.readout = ReadoutHead(use_lora=use_lora, quant_bits=quant_bits)
 
@@ -346,7 +361,7 @@ class MultiLayerPhotonicNN(torch.nn.Module):
             z_current = z_current + self.pos_bias(i)
             
             for layer in self.layers:
-                z_current = layer(z_current, z_cache, i, num_steps=M)
+                z_current = layer(z_current, z_cache, i, num_steps=self.num_steps)
             if i < seq_len - 1:
                 logits_list.append(self.readout(z_current))
             z_cache.append(z_current)
@@ -358,11 +373,11 @@ optimizer = None
 scheduler = None
 current_mode = "neural" # default
 
-def init_model(mode="neural", num_layers=LAYERS_DEFAULT, use_lora=False, lora_rank=4, quant_bits=None):
+def init_model(mode="neural", num_layers=LAYERS_DEFAULT, num_steps=M, use_lora=False, lora_rank=4, quant_bits=None):
     global model, optimizer, scheduler, current_mode
     current_mode = mode # Keep current_mode updated globally
-    model = MultiLayerPhotonicNN(num_layers=num_layers, mode=mode, use_lora=use_lora, lora_rank=lora_rank, quant_bits=quant_bits).to(DEVICE)
-    print(f"Photonic Model Initialized (Mode: {mode}, Layers: {num_layers}, LoRA: {use_lora} (rank {lora_rank}), Quant: {quant_bits}-bit)")
+    model = MultiLayerPhotonicNN(num_layers=num_layers, num_steps=num_steps, mode=mode, use_lora=use_lora, lora_rank=lora_rank, quant_bits=quant_bits).to(DEVICE)
+    print(f"Photonic Model Initialized (Mode: {mode}, Layers: {num_layers}, M: {num_steps}, LoRA: {use_lora} (rank {lora_rank}), Quant: {quant_bits}-bit)")
     optimizer = optim.Adam(model.parameters(), lr=LR)
     scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=LR*0.05)
 
@@ -373,6 +388,7 @@ def save_checkpoint(path=None):
         'scheduler_state': scheduler.state_dict(),
         'mode': model.mode,
         'num_layers': model.num_layers,
+        'num_steps': model.num_steps,
         'use_lora': model.use_lora,
         'lora_rank': model.lora_rank,
         'quant_bits': model.quant_bits
@@ -401,6 +417,7 @@ def load_checkpoint(path="model.pth"):
         model_state = checkpoint['model_state']
         saved_mode = checkpoint.get('mode', 'neural')
         saved_layers = checkpoint.get('num_layers', 4)
+        saved_steps = checkpoint.get('num_steps', M)
         saved_lora = checkpoint.get('use_lora')
         saved_rank = checkpoint.get('lora_rank', 4)
         saved_quant = checkpoint.get('quant_bits', None)
@@ -409,6 +426,7 @@ def load_checkpoint(path="model.pth"):
         model_state = checkpoint
         saved_mode = model.mode
         saved_layers = model.num_layers
+        saved_steps = model.num_steps
         saved_lora = model.use_lora
         saved_rank = model.lora_rank
         saved_quant = model.quant_bits
@@ -417,16 +435,17 @@ def load_checkpoint(path="model.pth"):
     mismatch = False
     if saved_mode != model.mode: mismatch = True
     if saved_layers != model.num_layers: mismatch = True
+    if saved_steps != model.num_steps: mismatch = True
     if saved_lora != model.use_lora: mismatch = True
     if saved_rank != model.lora_rank: mismatch = True
     if saved_quant != model.quant_bits: mismatch = True
 
     if mismatch:
         print(f"\n[!] Architecture mismatch detected!")
-        print(f"    Current Configuration:   Mode={model.mode}, Layers={model.num_layers}, LoRA={model.use_lora}, Rank={model.lora_rank}, Quant={model.quant_bits}")
-        print(f"    Checkpoint Configuration: Mode={saved_mode}, Layers={saved_layers}, LoRA={saved_lora}, Rank={saved_rank}, Quant={saved_quant}")
+        print(f"    Current Configuration:   Mode={model.mode}, Layers={model.num_layers}, M={model.num_steps}, LoRA={model.use_lora}, Rank={model.lora_rank}, Quant={model.quant_bits}")
+        print(f"    Checkpoint Configuration: Mode={saved_mode}, Layers={saved_layers}, M={saved_steps}, LoRA={saved_lora}, Rank={saved_rank}, Quant={saved_quant}")
         print(f"    Re-initializing model to match checkpoint...\n")
-        init_model(mode=saved_mode, num_layers=saved_layers, use_lora=saved_lora, lora_rank=saved_rank, quant_bits=saved_quant)
+        init_model(mode=saved_mode, num_layers=saved_layers, num_steps=saved_steps, use_lora=saved_lora, lora_rank=saved_rank, quant_bits=saved_quant)
 
     # If LoRA was active, we must re-filter the optimizer before loading its state
     if saved_lora:
@@ -761,7 +780,7 @@ def beam_search_generate(prompt: str, beam_width=BEAM_WIDTH, max_new=180, temper
         z_curr = model.token_embed(token_id).squeeze(0)
         z_curr = z_curr + model.pos_bias(i)
         for layer in model.layers:
-            z_curr = layer(z_curr, z_cache_init, i, num_steps=M)
+            z_curr = layer(z_curr, z_cache_init, i, num_steps=model.num_steps)
         z_cache_init.append(z_curr)
         logits = model.readout(z_curr)
 
@@ -795,7 +814,7 @@ def beam_search_generate(prompt: str, beam_width=BEAM_WIDTH, max_new=180, temper
                 
                 new_z_cache = z_cache.copy()
                 for layer in model.layers:
-                    z_curr = layer(z_curr, new_z_cache, current_pos, num_steps=M)
+                    z_curr = layer(z_curr, new_z_cache, current_pos, num_steps=model.num_steps)
                 new_z_cache.append(z_curr)
                 
                 new_beams.append((new_seq, new_logp, new_z_cache))
@@ -828,7 +847,7 @@ if __name__ == "__main__":
     parser.add_argument("--generate", action="store_true", help="Generate text")
     parser.add_argument("--load", action="store_true", help="Load checkpoint before running")
     parser.add_argument("--checkpoint", type=str, default="model.pth", help="Path to specific checkpoint file")
-    parser.add_argument("--mode", type=str, choices=["neural", "wave"], default="neural", help="Modulator mode")
+    parser.add_argument("--mode", type=str, choices=["neural", "wave"], default="wave", help="Modulator mode")
     parser.add_argument("--layers", type=int, default=LAYERS_DEFAULT, help="Number of layers")
     parser.add_argument("--epochs", type=int, default=EPOCHS, help="Number of training epochs")
     parser.add_argument("--steps", type=int, default=STEPS_PER_EPOCH, help="Steps per epoch")
@@ -840,6 +859,7 @@ if __name__ == "__main__":
     parser.add_argument("--lora", action="store_true", help="Use Low-Rank Adaptation (LoRA) for fine-tuning")
     parser.add_argument("--lora_rank", type=int, default=4, help="LoRA rank")
     parser.add_argument("--quant", action="store_true", help="Enable simulated 4-bit quantization")
+    parser.add_argument("--M", type=int, default=M, help="Number of internal evolution steps per layer")
     args = parser.parse_args()
 
     current_mode = args.mode
@@ -848,7 +868,7 @@ if __name__ == "__main__":
     
     # Initialize the model correctly before potentially loading
     quant_bits = 4 if args.quant else None
-    init_model(mode=current_mode, num_layers=args.layers, use_lora=args.lora, lora_rank=args.lora_rank, quant_bits=quant_bits)
+    init_model(mode=current_mode, num_layers=args.layers, num_steps=args.M, use_lora=args.lora, lora_rank=args.lora_rank, quant_bits=quant_bits)
 
     if args.load:
         load_checkpoint(args.checkpoint)
