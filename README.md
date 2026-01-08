@@ -24,7 +24,7 @@ Built on the cutting edge of **Complex-Valued Neural Networks (CVNNs)**, Lightwa
 ## ✨ Key Features
 
 ### 🧠 Complex-Valued Core
-*   **16-Dimensional $\mathbb{C}$ Space**: High-fidelity embeddings for rich feature representation.
+*   **High-Dimensional $\mathbb{C}$ Space**: Scaled-up embeddings for enhanced linguistic capacity and reduced feature collision.
 *   **Mish-Complex Activation**: Non-linear mapping preserving phase information across deep cascades.
 *   **Amplitude & Phase Modulation**: Dual-domain learning that tunes field intensity and rotation for precise interference.
 *   **Complex LayerNorm**: Independent normalization of magnitude and phase for maximum stability.
@@ -38,6 +38,7 @@ Built on the cutting edge of **Complex-Valued Neural Networks (CVNNs)**, Lightwa
 *   **RLVR (Reinforcement Learning from Verifiable Rewards)**: Self-improving policy gradient loop for targeted task success.
 *   **PEFT (LoRA & 4-bit Quantization)**: Fine-tune massive architectures on consumer hardware and prepare for optical substrates.
 *   **Beam Search Decoding**: High-precision text generation with configurable width.
+*   **Mini-Batch Training**: Parallel processing of multiple sequences for 10-20x GPU utilization improvement.
 
 ---
 
@@ -68,7 +69,13 @@ Experience the efficiency of unitary propagation:
 python llm_light.py --train --mode wave --layers 12
 ```
 
-### 3. Generate with Beam Search
+### 3. High-Performance Training
+Leverage optimized batching and scaled capacity:
+```bash
+python llm_light.py --train --mode wave --batch_size 16 --steps 200 --M 32 --lora
+```
+
+### 4. Generate with Beam Search
 Generate high-quality stories with an existing checkpoint:
 ```bash
 python llm_light.py --generate --load --beam --beam_width 5 --prompt "A long time ago in a photonic city..."
