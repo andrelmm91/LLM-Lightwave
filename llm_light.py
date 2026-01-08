@@ -15,8 +15,14 @@ from datetime import datetime
 #  Utils
 # ────────────────────────────────────────────────────────────────
 def mish(x):
-    """Mish activation function: x * tanh(softplus(x))"""
+    """Mish activation function: x * tanh(softplus(x))
+    NOTE: Deprecated in favor of tanh for stability in Wave Mode"""
     return x * torch.tanh(F.softplus(x))
+
+def bounded_activation(x):
+    """Bounded activation using tanh to prevent magnitude explosion
+    Strictly bounded to (-1, 1) ensuring energy conservation in Wave Mode"""
+    return torch.tanh(x)
 
 def simulate_quantization(weight, bits=4):
     """Simulate symmetric linear quantization during training"""
@@ -350,8 +356,8 @@ class PhotonicInterferenceLayer(torch.nn.Module):
                     mod_factor = self.modulator(pos, z_new, z_past_stacked, m=m)
                     z_new = z_new + c * mod_factor
 
-            # Photonic-style non-linearity (Mish)
-            z_new = mish(z_new.real) + 1j * mish(z_new.imag)
+            # Photonic-style non-linearity (Bounded Tanh for stability)
+            z_new = bounded_activation(z_new.real) + 1j * bounded_activation(z_new.imag)
         
         # Normalization once after all M steps (optimization)
         z_real = F.layer_norm(z_new.real, (z_new.real.size(-1),))
