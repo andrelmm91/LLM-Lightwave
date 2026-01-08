@@ -78,14 +78,15 @@ class LoRALinear(torch.nn.Module):
 #  Hyperparameters
 # ────────────────────────────────────────────────────────────────
 H = 4                # Number of parallel attention heads in the modulator
-M = 6                # Internal evolution steps (temporal depth) per layer
+M = 32               # Internal evolution steps (temporal depth) per layer
 LAYERS_DEFAULT = 4   # Default number of cascaded interference stages
-INITIAL_COUPLING = 0.67      # Initial coupling strength between field and candidate
+INITIAL_COUPLING = 0.5      # Initial coupling strength between field and candidate
 SEQ_LEN = 32        # Context window length for training samples
+BATCH_SIZE = 8       # Number of sequences processed in parallel
 EPOCHS = 15          # Total training passes over the dataset
 STEPS_PER_EPOCH = 200 # number of weight updates per epoch
 LR = 4e-4            # Initial learning rate for Adam optimizer
-EMBED_DIM = 16       # Total dimension: 8 real + 8 imaginary pairs (for 16D CVNN)
+EMBED_DIM = 64       # Scaling up capacity (32 complex dimensions)
 BEAM_WIDTH = 5       # Number of candidate beams maintained in beam search
 REL_MAX_DIST = 64    # Max relative distance for unique positional biases
 GRAD_CLIP = 1.0      # Maximum gradient norm to prevent explosions
@@ -100,14 +101,17 @@ print(f"Using device: {DEVICE}")
 tokenizer = tiktoken.get_encoding("gpt2")
 VOCAB_SIZE = tokenizer.n_vocab  # ~50257
 
-def get_random_chunk(text, length=SEQ_LEN):
-    """Sample random contiguous chunk from given text"""
-    start = random.randint(0, len(text) - length - 1)
-    chunk = text[start:start + length]
-    tokens = torch.tensor(tokenizer.encode(chunk, disallowed_special=()), dtype=torch.long, device=DEVICE)
-    if len(tokens) < length:
-        tokens = F.pad(tokens, (0, length - len(tokens)), value=tokenizer.eot_token)
-    return tokens[:length]
+def get_random_batch(text, batch_size=8, length=SEQ_LEN):
+    """Sample a batch of random contiguous chunks from given text"""
+    batch_tokens = []
+    for _ in range(batch_size):
+        start = random.randint(0, len(text) - length - 1)
+        chunk = text[start:start + length]
+        tokens = tokenizer.encode(chunk, disallowed_special=())
+        if len(tokens) < length:
+            tokens = tokens + [tokenizer.eot_token] * (length - len(tokens))
+        batch_tokens.append(tokens[:length])
+    return torch.tensor(batch_tokens, dtype=torch.long, device=DEVICE)
 
 # ────────────────────────────────────────────────────────────────
 #  Load TinyStories (download manually from HF)
@@ -158,9 +162,10 @@ class RelativePositionalBias(torch.nn.Module):
         self.bias = torch.nn.Parameter(torch.randn(size, dim, dtype=torch.complex64) * 0.02)
 
     def forward(self, rel_dist):
+        # rel_dist: int or [B] or [N]
         idx = rel_dist + REL_MAX_DIST
         if torch.is_tensor(idx):
-            idx = torch.clamp(idx, 0, len(self.bias) - 1)
+            idx = torch.clamp(idx, 0, len(self.bias) - 1).long()
         else:
             idx = max(0, min(idx, len(self.bias) - 1))
         return self.bias[idx]
@@ -181,55 +186,62 @@ class MultiHeadModulator(torch.nn.Module):
         self.rel_bias = RelativePositionalBias(dim=dim)
 
     def forward(self, curr_pos: int, z_curr, z_past, m: int = 0):
+        # z_curr: [B, dim], z_past: [T, B, dim]
         if z_past.numel() == 0:
-            return torch.zeros(self.dim, device=DEVICE, dtype=torch.complex64)
+            batch_size = z_curr.shape[0] if z_curr.dim() > 1 else 1
+            return torch.zeros((batch_size, self.dim), device=DEVICE, dtype=torch.complex64).squeeze()
 
         past_len = z_past.size(0)
+        batch_size = z_curr.shape[0]
         
         # 1. Project to Q, K, V (using real views for Linear layers)
-        q_real = torch.view_as_real(z_curr).flatten()
-        q_proj = self.q_proj(q_real)
+        q_real = torch.view_as_real(z_curr).reshape(batch_size, -1)
+        q_proj = self.q_proj(q_real) # [B, dim*2]
         
-        k_past_real = torch.view_as_real(z_past).flatten(start_dim=-2)
-        k_proj = self.k_proj(k_past_real)
+        k_past_real = torch.view_as_real(z_past).reshape(past_len, batch_size, -1)
+        k_proj = self.k_proj(k_past_real) # [T, B, dim*2]
         
-        v_past_real = torch.view_as_real(z_past).flatten(start_dim=-2)
-        v_proj = self.v_proj(v_past_real)
+        v_past_real = torch.view_as_real(z_past).reshape(past_len, batch_size, -1)
+        v_proj = self.v_proj(v_past_real) # [T, B, dim*2]
         
         # 2. Back to complex and split heads
-        q_c = torch.view_as_complex(q_proj.view(self.dim, 2))
-        k_c = torch.view_as_complex(k_proj.view(-1, self.dim, 2))
-        v_c = torch.view_as_complex(v_proj.view(-1, self.dim, 2))
+        q_c = torch.view_as_complex(q_proj.view(batch_size, self.dim, 2))
+        k_c = torch.view_as_complex(k_proj.view(past_len, batch_size, self.dim, 2))
+        v_c = torch.view_as_complex(v_proj.view(past_len, batch_size, self.dim, 2))
         
-        q_h = q_c.view(self.heads, self.head_dim)          # [H, d]
-        k_h = k_c.view(past_len, self.heads, self.head_dim) # [N, H, d]
-        v_h = v_c.view(past_len, self.heads, self.head_dim) # [N, H, d]
+        q_h = q_c.view(batch_size, self.heads, self.head_dim)          # [B, H, d]
+        k_h = k_c.view(past_len, batch_size, self.heads, self.head_dim) # [T, B, H, d]
+        v_h = v_c.view(past_len, batch_size, self.heads, self.head_dim) # [T, B, H, d]
         
-        # 3. Upgrade A: Dot-product style scores
-        # scores: real(conj(Q) * K) summed over head_dim
-        # Broadcast conj(q_h) across past tokens
-        dot_scores = torch.real((torch.conj(q_h).unsqueeze(0) * k_h).sum(dim=-1)) # [N, H]
+        # 3. Upgrade A: Dot-product style scores [B, H, T]
+        # q_h: [B, H, d], k_h: [T, B, H, d]
+        # We want inner product over 'd' for each batch and head
+        dot_scores = torch.real((q_h.unsqueeze(0) * torch.conj(k_h)).sum(dim=-1)) # [T, B, H]
+        dot_scores = dot_scores.permute(1, 2, 0) # [B, H, T]
         
         # 4. Upgrade B: Relative positional attention bias
         rel_dists = torch.arange(curr_pos - past_len, curr_pos, device=DEVICE)
-        rel_biases_c = self.rel_bias(rel_dists) # [N, dim]
-        rel_biases_h = rel_biases_c.view(past_len, self.heads, self.head_dim)
+        rel_biases_c = self.rel_bias(rel_dists) # [T, dim]
+        rel_biases_h = rel_biases_c.view(past_len, 1, self.heads, self.head_dim) # [T, 1, H, d]
         
-        rel_scores = torch.real((torch.conj(q_h).unsqueeze(0) * rel_biases_h).sum(dim=-1)) # [N, H]
+        rel_scores = torch.real((q_h.unsqueeze(0) * torch.conj(rel_biases_h)).sum(dim=-1)) # [T, B, H]
+        rel_scores = rel_scores.permute(1, 2, 0) # [B, H, T]
         
         # 5. Combine and Softmax
         final_scores = (dot_scores + rel_scores) / math.sqrt(self.head_dim)
-        weights = F.softmax(final_scores, dim=0) # [N, H]
+        weights = F.softmax(final_scores, dim=-1) # [B, H, T]
         
         # 6. Weighted sum of values
-        # weights: [N, H] -> [N, H, 1]
-        out_h = (weights.unsqueeze(-1) * v_h).sum(dim=0) # [H, d]
+        # weights: [B, H, T] -> [B, H, 1, T]
+        # v_h: [T, B, H, d] -> [B, H, T, d]
+        v_h_perm = v_h.permute(1, 2, 0, 3) 
+        out_h = torch.matmul(weights.unsqueeze(-2), v_h_perm).squeeze(-2) # [B, H, d]
         
         # 7. Final Projection
-        out_c = out_h.view(self.dim)
-        out_proj = self.out_proj(torch.view_as_real(out_c).flatten())
+        out_c = out_h.reshape(batch_size, self.dim)
+        out_proj = self.out_proj(torch.view_as_real(out_c).view(batch_size, -1))
         
-        return torch.view_as_complex(out_proj.view(self.dim, 2))
+        return torch.view_as_complex(out_proj.view(batch_size, self.dim, 2))
 
 class ReadoutHead(torch.nn.Module):
     def __init__(self, dim=EMBED_DIM, vocab_size=VOCAB_SIZE, use_lora=False, quant_bits=None):
@@ -257,38 +269,52 @@ class QuantumWaveModulator(torch.nn.Module):
         # Learnable phase shifts (matrices of shape [M, dim])
         self.phase_u = torch.nn.Parameter(torch.zeros(m_steps, dim))
         self.phase_v = torch.nn.Parameter(torch.zeros(m_steps, dim))
+        
+        # Cached phase exponentials for speed with dirty flag
+        self.register_buffer('_phase_exp_u_cache', None)
+        self.register_buffer('_phase_exp_v_cache', None)
+        self.register_buffer('_cache_valid', torch.tensor(False))
+    
+    def invalidate_cache(self):
+        """Mark cache as invalid (call after optimizer.step())"""
+        self._cache_valid = torch.tensor(False)
+    
+    def _update_cache(self):
+        """Update phase exponential cache"""
+        self._phase_exp_u_cache = torch.exp(1j * self.phase_u)
+        self._phase_exp_v_cache = torch.exp(1j * self.phase_v)
+        self._cache_valid = torch.tensor(True)
 
     def forward(self, curr_pos, z_curr, z_past_stacked, m: int = 0, coupling=INITIAL_COUPLING):
+        # z_curr: [B, dim], z_past_stacked: [T, B, dim]
         if z_past_stacked is None:
             return torch.zeros_like(z_curr)
             
         # 1. Capture the 'previous' state from the historical field
-        u_prev = z_past_stacked[-1] # [dim]
-        v_curr = z_curr             # [dim]
+        u_prev = z_past_stacked[-1] # [B, dim]
+        v_curr = z_curr             # [B, dim]
         
-        # 2. Apply learnable phase rotations for the current step m
-        u_prev = u_prev * torch.exp(1j * self.phase_u[m])
-        v_curr = v_curr * torch.exp(1j * self.phase_v[m])
+        # 2. Apply learnable phase rotations (with smart caching)
+        if not self._cache_valid:
+            self._update_cache()
+        
+        u_prev = u_prev * self._phase_exp_u_cache[m]
+        v_curr = v_curr * self._phase_exp_v_cache[m]
         
         # 3. Apply Unitary Coin (Interference)
-        # Using coupling to mix components
-        state = torch.stack([u_prev, v_curr], dim=0) # [2, dim]
-        out = (self.coin * coupling) @ state # [2, dim]
+        state = torch.stack([u_prev, v_curr], dim=1) # [B, 2, dim]
+        out = (self.coin * coupling) @ state # [B, 2, dim]
         
-        # 4. Ballistic Shift with Reflecting Boundaries
-        u_prime = out[0]
-        v_prime = out[1]
+        # 4. Optimized Ballistic Shift with Reflecting Boundaries
+        u_prime = out[:, 0, :] # [B, dim]
+        v_prime = out[:, 1, :] # [B, dim]
         
-        u_shifted = torch.zeros_like(u_prime)
-        v_shifted = torch.zeros_like(v_prime)
+        # Use torch.roll for efficient shifting
+        u_shifted = torch.roll(u_prime, shifts=1, dims=1)
+        u_shifted[:, 0] = v_prime[:, 0]  # Reflect at left boundary
         
-        # Right shift for U (forward moving), reflection at left boundary (0)
-        u_shifted[1:] = u_prime[:-1]
-        u_shifted[0] = v_prime[0] # Reflect V-left into U-right at index 0
-        
-        # Left shift for V (backward moving), reflection at right boundary (dim-1)
-        v_shifted[:-1] = v_prime[1:]
-        v_shifted[-1] = u_prime[-1] # Reflect U-right into V-left at index dim-1
+        v_shifted = torch.roll(v_prime, shifts=-1, dims=1)
+        v_shifted[:, -1] = u_prime[:, -1]  # Reflect at right boundary
         
         return u_shifted + v_shifted
 
@@ -324,12 +350,13 @@ class PhotonicInterferenceLayer(torch.nn.Module):
                     mod_factor = self.modulator(pos, z_new, z_past_stacked, m=m)
                     z_new = z_new + c * mod_factor
 
-            # Photonic-style non-linearity (Mish) and normalization
+            # Photonic-style non-linearity (Mish)
             z_new = mish(z_new.real) + 1j * mish(z_new.imag)
-            # Complex LayerNorm (real and imag independently) + learned scaling
-            z_real = F.layer_norm(z_new.real, (z_new.real.size(-1),))
-            z_imag = F.layer_norm(z_new.imag, (z_new.imag.size(-1),))
-            z_new = (z_real + 1j * z_imag) * self.norm_scale
+        
+        # Normalization once after all M steps (optimization)
+        z_real = F.layer_norm(z_new.real, (z_new.real.size(-1),))
+        z_imag = F.layer_norm(z_new.imag, (z_new.imag.size(-1),))
+        z_new = (z_real + 1j * z_imag) * self.norm_scale
             
         return z_new
 
@@ -350,13 +377,14 @@ class MultiLayerPhotonicNN(torch.nn.Module):
         ])
         self.readout = ReadoutHead(use_lora=use_lora, quant_bits=quant_bits)
 
-    def forward_incremental(self, token_ids):
-        seq_len = token_ids.size(0)
+    def forward_incremental(self, batch_ids):
+        # batch_ids: [Batch, SeqLen]
+        batch_size, seq_len = batch_ids.shape
         z_cache = []
         logits_list = []
 
         for i in range(seq_len):
-            z_current = self.token_embed(token_ids[i:i+1]).squeeze(0)
+            z_current = self.token_embed(batch_ids[:, i]) # [B, dim]
             # Add relative positional bias
             z_current = z_current + self.pos_bias(i)
             
@@ -365,7 +393,9 @@ class MultiLayerPhotonicNN(torch.nn.Module):
             if i < seq_len - 1:
                 logits_list.append(self.readout(z_current))
             z_cache.append(z_current)
-        return torch.stack(logits_list)
+            
+        # Stacked logits: [SeqLen-1, B, Vocab] -> Transpose to [B, SeqLen-1, Vocab]
+        return torch.stack(logits_list).transpose(0, 1)
 
 # Model placeholder
 model = None
@@ -395,14 +425,11 @@ def save_checkpoint(path=None):
     }
     
     torch.save(checkpoint, "model.pth")
-    if path is None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-        dynamic_path = f"model_{current_mode}_{timestamp}.pth"
-        torch.save(checkpoint, dynamic_path)
-        print(f"Checkpoints saved: model.pth and {dynamic_path}")
-    else:
+    if path:
         torch.save(checkpoint, path)
-        print(f"Checkpoint saved: {path}")
+        print(f"Checkpoint saved: model.pth and {path}")
+    else:
+        print(f"Checkpoint updated: model.pth")
 
 def load_checkpoint(path="model.pth"):
     global current_mode, optimizer, scheduler, model
@@ -483,16 +510,20 @@ def load_checkpoint(path="model.pth"):
 #  Validation perplexity
 # ────────────────────────────────────────────────────────────────
 @torch.no_grad()
-def validate():
+def validate(val_batches=None):
     model.eval()
     total_loss = 0.0
     num_samples = 0
+    
+    # Use pre-generated batches if provided, otherwise generate on-the-fly
+    if val_batches is None:
+        val_batches = [get_random_batch(val_text, batch_size=BATCH_SIZE) for _ in range(VAL_STEPS)]
 
-    for _ in range(VAL_STEPS):
-        seq = get_random_chunk(val_text)
-        logits = model.forward_incremental(seq)
-        target = seq[1:]
-        loss = F.cross_entropy(logits, target, ignore_index=tokenizer.eot_token, reduction='sum')
+    for batch in val_batches:
+        logits = model.forward_incremental(batch)
+        target = batch[:, 1:]
+        loss = F.cross_entropy(logits.reshape(-1, VOCAB_SIZE), target.reshape(-1), 
+                               ignore_index=tokenizer.eot_token, reduction='sum')
         total_loss += loss.item()
         num_samples += target.numel()
 
@@ -506,6 +537,10 @@ def validate():
 def train():
     print(f"Long training | Max epochs: {EPOCHS} | Steps per epoch: {STEPS_PER_EPOCH}")
     best_val_ppl = float('inf')
+    
+    # Pre-generate validation batches for consistency and speed
+    print("Pre-generating validation batches...")
+    val_batches = [get_random_batch(val_text, batch_size=BATCH_SIZE) for _ in range(VAL_STEPS)]
 
     # If LoRA is enabled, freeze base weights and only train adapters
     # Note: We still keep 'coupling' and 'norm_scale' trainable by default 
@@ -531,38 +566,46 @@ def train():
 
         with tqdm(total=STEPS_PER_EPOCH, desc=f"Epoch {epoch}/{EPOCHS} Train") as pbar:
             while steps < STEPS_PER_EPOCH:
-                seq = get_random_chunk(train_text)
-                logits = model.forward_incremental(seq)
-                target = seq[1:]
+                batch = get_random_batch(train_text, batch_size=BATCH_SIZE)
+                logits = model.forward_incremental(batch)
+                target = batch[:, 1:]
 
-                loss = F.cross_entropy(logits, target, ignore_index=tokenizer.eot_token)
+                loss = F.cross_entropy(logits.reshape(-1, VOCAB_SIZE), target.reshape(-1), ignore_index=tokenizer.eot_token)
                 loss.backward()
                 
                 torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
                 optimizer.step()
                 optimizer.zero_grad()
                 
-                total_train_loss += loss.item()
+                # Invalidate phase cache after parameter update
+                for layer in model.layers:
+                    if hasattr(layer.modulator, 'invalidate_cache'):
+                        layer.modulator.invalidate_cache()
+                
                 steps += 1
+                total_train_loss += loss.item()
+                avg_loss = total_train_loss / steps
+                running_ppl = math.exp(avg_loss) if avg_loss < 20 else 99.0
                 pbar.update(1)
-                pbar.set_postfix(loss=f"{loss.item():.4f}")
+                pbar.set_postfix(avg_loss=f"{avg_loss:.4f}", avg_ppl=f"{running_ppl:.1f}")
         
         scheduler.step()
         train_loss = total_train_loss / STEPS_PER_EPOCH
 
-        # Validation
-        val_ppl, val_loss = validate()
+        # Validation (with pre-generated batches)
+        val_ppl, val_loss = validate(val_batches)
         print(f"Epoch {epoch:2d} | Train Loss: {train_loss:.4f} | "
               f"Val Loss: {val_loss:.4f} | Val PPL: {val_ppl:.2f} | LR: {scheduler.get_last_lr()[0]:.6f}")
 
         if val_ppl < best_val_ppl:
             best_val_ppl = val_ppl
             save_path = f"best_model_valppl_{val_ppl:.2f}.pt"
-            # Use the unified save_checkpoint logic to include metadata
             save_checkpoint(path=save_path)
             print(f"  → New best model saved: {save_path}")
 
-        save_checkpoint()
+        # Save checkpoint every 5 epochs or on last epoch
+        if epoch % 5 == 0 or epoch == EPOCHS:
+            save_checkpoint()
 
     print("Training finished.")
 
@@ -613,16 +656,15 @@ def rl_train(steps=100, samples_per_step=4):
     rl_optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=LR * 0.5)
     
     for step in range(steps):
-        # 1. Sample a random prompt from train text
-        prompt_raw = get_random_chunk(train_text, length=64)
-        prompt = tokenizer.decode(prompt_raw.tolist())
+        # 1. Sample a batch of random prompts from train text
+        prompt_batch = get_random_batch(train_text, batch_size=samples_per_step, length=64)
         
         batch_loss = 0.0
         total_reward = 0.0
         
-        for _ in range(samples_per_step):
+        for i in range(samples_per_step):
             # 2. Rollout: Generate with tracking gradients
-            # We need a modified generate that tracks log_probs
+            prompt = tokenizer.decode(prompt_batch[i].tolist())
             trajectory_tokens, log_probs = rollout(prompt, max_new=50)
             generated_text = tokenizer.decode(trajectory_tokens.tolist())
             
@@ -657,15 +699,15 @@ def rollout(prompt, max_new=50, temperature=0.9):
     prompt_tokens = torch.tensor(tokenizer.encode(prompt, disallowed_special=()), device=DEVICE)
     z_cache = []
     
-    # Process prompt
+    # Prefill cache with prompt
     for i in range(len(prompt_tokens)):
         token_id = prompt_tokens[i:i+1]
-        z_curr = model.token_embed(token_id).squeeze(0)
+        z_curr = model.token_embed(token_id).squeeze(0).unsqueeze(0)  # [1, dim]
         z_curr = z_curr + model.pos_bias(i)
         for layer in model.layers:
             z_curr = layer(z_curr, z_cache, i, num_steps=M)
         z_cache.append(z_curr)
-        logits = model.readout(z_curr)
+        logits = model.readout(z_curr).squeeze(0)  # [vocab]
 
     trajectory = []
     log_probs = []
@@ -681,13 +723,13 @@ def rollout(prompt, max_new=50, temperature=0.9):
         
         if next_token.item() == tokenizer.eot_token:
             break
-            
-        z_curr = model.token_embed(next_token.unsqueeze(0)).squeeze(0)
+         # Feed prediction back
+        z_curr = model.token_embed(next_token).squeeze(0).unsqueeze(0)  # [1, dim]
         z_curr = z_curr + model.pos_bias(current_pos)
         for layer in model.layers:
             z_curr = layer(z_curr, z_cache, current_pos, num_steps=M)
         z_cache.append(z_curr)
-        logits = model.readout(z_curr)
+        logits = model.readout(z_curr).squeeze(0)  # [vocab]
         current_pos += 1
         
     return torch.stack(trajectory), torch.stack(log_probs)
@@ -730,13 +772,13 @@ def generate(prompt: str, max_new=180, temperature=0.92):
     logits = None
     for i in range(len(prompt_tokens)):
         token_id = prompt_tokens[i:i+1]
-        z_curr = model.token_embed(token_id).squeeze(0)
+        z_curr = model.token_embed(token_id).squeeze(0).unsqueeze(0)  # [1, dim]
         z_curr = z_curr + model.pos_bias(i)
         
         for layer in model.layers:
             z_curr = layer(z_curr, z_cache, i, num_steps=M)
         z_cache.append(z_curr)
-        logits = model.readout(z_curr)
+        logits = model.readout(z_curr).squeeze(0)  # [vocab]
 
     generated_tokens = prompt_tokens.clone()
     current_pos = len(prompt_tokens)
@@ -751,13 +793,13 @@ def generate(prompt: str, max_new=180, temperature=0.92):
             break
 
         # Feed prediction back through the layers
-        z_curr = model.token_embed(next_token).squeeze(0)
+        z_curr = model.token_embed(next_token).squeeze(0).unsqueeze(0)  # [1, dim]
         z_curr = z_curr + model.pos_bias(current_pos)
         
         for layer in model.layers:
             z_curr = layer(z_curr, z_cache, current_pos, num_steps=M)
         z_cache.append(z_curr)
-        logits = model.readout(z_curr)
+        logits = model.readout(z_curr).squeeze(0)  # [vocab]
         current_pos += 1
 
     return tokenizer.decode(generated_tokens.tolist())
@@ -777,12 +819,12 @@ def beam_search_generate(prompt: str, beam_width=BEAM_WIDTH, max_new=180, temper
     logits = None
     for i in range(prompt_len):
         token_id = prompt_tokens[i:i+1]
-        z_curr = model.token_embed(token_id).squeeze(0)
+        z_curr = model.token_embed(token_id).squeeze(0).unsqueeze(0)  # [1, dim]
         z_curr = z_curr + model.pos_bias(i)
         for layer in model.layers:
             z_curr = layer(z_curr, z_cache_init, i, num_steps=model.num_steps)
         z_cache_init.append(z_curr)
-        logits = model.readout(z_curr)
+        logits = model.readout(z_curr).squeeze(0)  # [vocab]
 
     beams = [(prompt_tokens.clone(), 0.0, z_cache_init)]
 
@@ -790,9 +832,7 @@ def beam_search_generate(prompt: str, beam_width=BEAM_WIDTH, max_new=180, temper
         new_beams = []
         for seq, logp, z_cache in beams:
             # Get logits for the LAST token in the current sequence
-            # Wait, the way incremental works: we need the z_cache to produce logits for NEXT token
-            # z_cache[-1] already went through layers, so readout(z_cache[-1]) gives next token logits
-            logits = model.readout(z_cache[-1]) / temperature
+            logits = model.readout(z_cache[-1]).squeeze(0) / temperature  # [vocab]
             probs = F.softmax(logits, dim=-1)
             top_probs, top_ids = probs.topk(beam_width)
 
@@ -808,14 +848,12 @@ def beam_search_generate(prompt: str, beam_width=BEAM_WIDTH, max_new=180, temper
                 new_seq = torch.cat([seq, new_token])
                 
                 # Update cache for the new token
-                current_pos = len(seq)
-                z_curr = model.token_embed(new_token).squeeze(0)
-                z_curr = z_curr + model.pos_bias(current_pos)
-                
-                new_z_cache = z_cache.copy()
+                new_z_cache = [z.clone() for z in z_cache]
+                z_new = model.token_embed(new_token).squeeze(0).unsqueeze(0)  # [1, dim]
+                z_new = z_new + model.pos_bias(len(new_seq) - 1)
                 for layer in model.layers:
-                    z_curr = layer(z_curr, new_z_cache, current_pos, num_steps=model.num_steps)
-                new_z_cache.append(z_curr)
+                    z_new = layer(z_new, new_z_cache, len(new_seq) - 1, num_steps=model.num_steps)
+                new_z_cache.append(z_new)
                 
                 new_beams.append((new_seq, new_logp, new_z_cache))
 
@@ -851,6 +889,7 @@ if __name__ == "__main__":
     parser.add_argument("--layers", type=int, default=LAYERS_DEFAULT, help="Number of layers")
     parser.add_argument("--epochs", type=int, default=EPOCHS, help="Number of training epochs")
     parser.add_argument("--steps", type=int, default=STEPS_PER_EPOCH, help="Steps per epoch")
+    parser.add_argument("--batch_size", type=int, default=BATCH_SIZE, help="Batch size for training")
     parser.add_argument("--prompt", type=str, default="Once upon a time there was a little girl who loved to", help="Prompt for generation")
     parser.add_argument("--beam", action="store_true", help="Use beam search for generation")
     parser.add_argument("--beam_width", type=int, default=BEAM_WIDTH, help="Beam width")
@@ -865,6 +904,7 @@ if __name__ == "__main__":
     current_mode = args.mode
     EPOCHS = args.epochs
     STEPS_PER_EPOCH = args.steps
+    BATCH_SIZE = args.batch_size
     
     # Initialize the model correctly before potentially loading
     quant_bits = 4 if args.quant else None
