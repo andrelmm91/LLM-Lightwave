@@ -45,8 +45,8 @@ Built on the cutting edge of **Complex-Valued Neural Networks (CVNNs)**, Lightwa
 
 ```bash
 # Clone the repository
-git clone https://github.com/andrelmm91/LLM_lightwave
-cd LLM_lightwave
+git clone https://github.com/andrelmm91/LLM-Lightwave
+cd LLM-Lightwave
 
 # Install dependencies
 pip install -r requirements.txt
