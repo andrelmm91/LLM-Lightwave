@@ -413,6 +413,21 @@ def load_checkpoint(path="model.pth"):
         saved_rank = model.lora_rank
         saved_quant = model.quant_bits
     
+    # Detect and Resolve Architecture Mismatch
+    mismatch = False
+    if saved_mode != model.mode: mismatch = True
+    if saved_layers != model.num_layers: mismatch = True
+    if saved_lora != model.use_lora: mismatch = True
+    if saved_rank != model.lora_rank: mismatch = True
+    if saved_quant != model.quant_bits: mismatch = True
+
+    if mismatch:
+        print(f"\n[!] Architecture mismatch detected!")
+        print(f"    Current Configuration:   Mode={model.mode}, Layers={model.num_layers}, LoRA={model.use_lora}, Rank={model.lora_rank}, Quant={model.quant_bits}")
+        print(f"    Checkpoint Configuration: Mode={saved_mode}, Layers={saved_layers}, LoRA={saved_lora}, Rank={saved_rank}, Quant={saved_quant}")
+        print(f"    Re-initializing model to match checkpoint...\n")
+        init_model(mode=saved_mode, num_layers=saved_layers, use_lora=saved_lora, lora_rank=saved_rank, quant_bits=saved_quant)
+
     # If LoRA was active, we must re-filter the optimizer before loading its state
     if saved_lora:
         for name, param in model.named_parameters():
