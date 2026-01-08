@@ -424,10 +424,23 @@ def load_checkpoint(path="model.pth"):
         optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=LR)
         scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=LR*0.05)
 
+    missing_keys, unexpected_keys = model.load_state_dict(model_state, strict=False)
+    if missing_keys:
+        print(f"Warning: Missing keys in state_dict: {missing_keys}")
+    if unexpected_keys:
+        print(f"Warning: Unexpected keys in state_dict: {unexpected_keys}")
+
     if 'optimizer_state' in checkpoint:
-        optimizer.load_state_dict(checkpoint['optimizer_state'])
+        try:
+            optimizer.load_state_dict(checkpoint['optimizer_state'])
+        except Exception as e:
+            print(f"Warning: Could not load optimizer state: {e}")
+            
     if 'scheduler_state' in checkpoint:
-        scheduler.load_state_dict(checkpoint['scheduler_state'])
+        try:
+            scheduler.load_state_dict(checkpoint['scheduler_state'])
+        except Exception as e:
+            print(f"Warning: Could not load scheduler state: {e}")
     
     print(f"Checkpoint loaded: {path} (Mode: {saved_mode}, Layers: {saved_layers})")
     return True
