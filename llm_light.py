@@ -87,16 +87,17 @@ H = 4                # Number of parallel attention heads in the modulator
 M = 32               # Internal evolution steps (temporal depth) per layer
 LAYERS_DEFAULT = 4   # Default number of cascaded interference stages
 INITIAL_COUPLING = 0.5      # Initial coupling strength between field and candidate
-SEQ_LEN = 32        # Context window length for training samples
+SEQ_LEN = 64        # Context window length for training samples
 BATCH_SIZE = 8       # Number of sequences processed in parallel
 EPOCHS = 15          # Total training passes over the dataset
 STEPS_PER_EPOCH = 200 # number of weight updates per epoch
 LR = 4e-4            # Initial learning rate for Adam optimizer
-EMBED_DIM = 64       # Scaling up capacity (32 complex dimensions)
+EMBED_DIM = 128       # Scaling up capacity (32 complex dimensions)
 BEAM_WIDTH = 5       # Number of candidate beams maintained in beam search
 REL_MAX_DIST = 64    # Max relative distance for unique positional biases
 GRAD_CLIP = 1.0      # Maximum gradient norm to prevent explosions
 VAL_STEPS = 100      # Number of validation chunks to sample each epoch
+TEMPERATURE = 0.7   # Sampling temperature for generation (lower = more focused, higher = more random)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
@@ -277,9 +278,9 @@ class QuantumWaveModulator(torch.nn.Module):
         self.phase_v = torch.nn.Parameter(torch.zeros(m_steps, dim))
         
         # Cached phase exponentials for speed with dirty flag
-        self.register_buffer('_phase_exp_u_cache', None)
-        self.register_buffer('_phase_exp_v_cache', None)
-        self.register_buffer('_cache_valid', torch.tensor(False))
+        self.register_buffer('_phase_exp_u_cache', None, persistent=False)
+        self.register_buffer('_phase_exp_v_cache', None, persistent=False)
+        self.register_buffer('_cache_valid', torch.tensor(False), persistent=False)
     
     def invalidate_cache(self):
         """Mark cache as invalid (call after optimizer.step())"""
@@ -301,7 +302,7 @@ class QuantumWaveModulator(torch.nn.Module):
         v_curr = z_curr             # [B, dim]
         
         # 2. Apply learnable phase rotations (with smart caching)
-        if not self._cache_valid:
+        if self._phase_exp_u_cache is None or not self._cache_valid:
             self._update_cache()
         
         u_prev = u_prev * self._phase_exp_u_cache[m]
@@ -490,6 +491,11 @@ def load_checkpoint(path="model.pth"):
         
         optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=LR)
         scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=LR*0.05)
+
+    # Filter out transient cache buffers from checkpoint to avoid warnings
+    keys_to_remove = [k for k in model_state.keys() if '_phase_exp_' in k or '_cache_valid' in k]
+    for k in keys_to_remove:
+        del model_state[k]
 
     missing_keys, unexpected_keys = model.load_state_dict(model_state, strict=False)
     if missing_keys:
@@ -700,7 +706,7 @@ def rl_train(steps=100, samples_per_step=4):
     torch.save(model.state_dict(), save_path)
     print(f"RL Fine-tuning finished. Saved to {save_path}")
 
-def rollout(prompt, max_new=50, temperature=0.9):
+def rollout(prompt, max_new=50, temperature=0.1):
     """Generate a sequence while tracking log-probabilities for RL"""
     prompt_tokens = torch.tensor(tokenizer.encode(prompt, disallowed_special=()), device=DEVICE)
     z_cache = []
@@ -711,7 +717,7 @@ def rollout(prompt, max_new=50, temperature=0.9):
         z_curr = model.token_embed(token_id).squeeze(0).unsqueeze(0)  # [1, dim]
         z_curr = z_curr + model.pos_bias(i)
         for layer in model.layers:
-            z_curr = layer(z_curr, z_cache, i, num_steps=M)
+            z_curr = layer(z_curr, z_cache, i, num_steps=model.num_steps)
         z_cache.append(z_curr)
         logits = model.readout(z_curr).squeeze(0)  # [vocab]
 
@@ -733,7 +739,7 @@ def rollout(prompt, max_new=50, temperature=0.9):
         z_curr = model.token_embed(next_token).squeeze(0).unsqueeze(0)  # [1, dim]
         z_curr = z_curr + model.pos_bias(current_pos)
         for layer in model.layers:
-            z_curr = layer(z_curr, z_cache, current_pos, num_steps=M)
+            z_curr = layer(z_curr, z_cache, current_pos, num_steps=model.num_steps)
         z_cache.append(z_curr)
         logits = model.readout(z_curr).squeeze(0)  # [vocab]
         current_pos += 1
@@ -770,7 +776,7 @@ def run_final_tests():
 #  Generation with real tokenizer
 # ────────────────────────────────────────────────────────────────
 @torch.no_grad()
-def generate(prompt: str, max_new=180, temperature=0.92):
+def generate(prompt: str, max_new=180, temperature=TEMPERATURE):
     prompt_tokens = torch.tensor(tokenizer.encode(prompt, disallowed_special=()), device=DEVICE)
     z_cache = []
 
@@ -782,7 +788,7 @@ def generate(prompt: str, max_new=180, temperature=0.92):
         z_curr = z_curr + model.pos_bias(i)
         
         for layer in model.layers:
-            z_curr = layer(z_curr, z_cache, i, num_steps=M)
+            z_curr = layer(z_curr, z_cache, i, num_steps=model.num_steps)
         z_cache.append(z_curr)
         logits = model.readout(z_curr).squeeze(0)  # [vocab]
 
@@ -803,7 +809,7 @@ def generate(prompt: str, max_new=180, temperature=0.92):
         z_curr = z_curr + model.pos_bias(current_pos)
         
         for layer in model.layers:
-            z_curr = layer(z_curr, z_cache, current_pos, num_steps=M)
+            z_curr = layer(z_curr, z_cache, current_pos, num_steps=model.num_steps)
         z_cache.append(z_curr)
         logits = model.readout(z_curr).squeeze(0)  # [vocab]
         current_pos += 1
@@ -814,12 +820,18 @@ def generate(prompt: str, max_new=180, temperature=0.92):
 #  Beam Search Generation
 # ────────────────────────────────────────────────────────────────
 @torch.no_grad()
-def beam_search_generate(prompt: str, beam_width=BEAM_WIDTH, max_new=180, temperature=0.9):
+def beam_search_generate(prompt: str, beam_width=BEAM_WIDTH, max_new=180, temperature=TEMPERATURE, length_penalty=0.6, min_length=40):
     model.eval()
     prompt_tokens = torch.tensor(tokenizer.encode(prompt, disallowed_special=()), device=DEVICE)
     prompt_len = len(prompt_tokens)
+    
+    # For beam search, ensure temperature isn't too low (causes beam collapse)
+    # Beam search works best with temperature >= 0.7 for diversity
+    effective_temp = max(temperature, 0.7)
+    if temperature < 0.7:
+        print(f"Note: Temperature {temperature} is too low for beam search. Using {effective_temp} instead.")
 
-    # Beam element: (sequence_tensor, log_prob, z_cache_list)
+    # Beam element: (sequence_tensor, log_prob, z_cache_list, is_finished)
     # Start with prefilling the cache for the prompt
     z_cache_init = []
     logits = None
@@ -832,55 +844,125 @@ def beam_search_generate(prompt: str, beam_width=BEAM_WIDTH, max_new=180, temper
         z_cache_init.append(z_curr)
         logits = model.readout(z_curr).squeeze(0)  # [vocab]
 
-    beams = [(prompt_tokens.clone(), 0.0, z_cache_init)]
+    beams = [(prompt_tokens.clone(), 0.0, z_cache_init, False)]
+    finished_beams = []
 
     for step in range(max_new):
         new_beams = []
-        for seq, logp, z_cache in beams:
+        
+        for seq, logp, z_cache, is_finished in beams:
+            # If beam is already finished, add to finished list
+            if is_finished:
+                finished_beams.append((seq, logp, z_cache, is_finished))
+                continue
+
             # Get logits for the LAST token in the current sequence
-            logits = model.readout(z_cache[-1]).squeeze(0) / temperature  # [vocab]
+            logits = model.readout(z_cache[-1]).squeeze(0)  # [vocab]
+            
+            # Suppress EOT token probability until minimum length is reached
+            if step < min_length:
+                logits[tokenizer.eot_token] = -float('inf')
+            
+            # Apply temperature and compute probabilities
+            logits = logits / effective_temp
             probs = F.softmax(logits, dim=-1)
-            top_probs, top_ids = probs.topk(beam_width)
+            
+            # Expand beam with top-k candidates (more candidates for better exploration)
+            top_probs, top_ids = probs.topk(beam_width * 3)
 
-            for k in range(beam_width):
+            beam_candidates = []
+            for k in range(min(beam_width * 3, len(top_ids))):
                 new_token = top_ids[k:k+1]
-                new_logp = logp + torch.log(top_probs[k] + 1e-10).item()
+                token_prob = top_probs[k].item()
                 
-                # Check if it was already EOT
-                if seq[-1].item() == tokenizer.eot_token:
-                    new_beams.append((seq, logp, z_cache))
+                # Skip very low probability tokens
+                if token_prob < 1e-10:
                     continue
-
+                
+                new_logp = logp + torch.log(torch.tensor(token_prob + 1e-12)).item()
                 new_seq = torch.cat([seq, new_token])
                 
-                # Update cache for the new token
-                new_z_cache = [z.clone() for z in z_cache]
-                z_new = model.token_embed(new_token).squeeze(0).unsqueeze(0)  # [1, dim]
-                z_new = z_new + model.pos_bias(len(new_seq) - 1)
-                for layer in model.layers:
-                    z_new = layer(z_new, new_z_cache, len(new_seq) - 1, num_steps=model.num_steps)
-                new_z_cache.append(z_new)
+                # Check if this beam is now finished (only after min_length)
+                new_is_finished = (new_token.item() == tokenizer.eot_token) and (step >= min_length)
                 
-                new_beams.append((new_seq, new_logp, new_z_cache))
+                if new_is_finished:
+                    # Apply length penalty and add to finished beams
+                    # Length penalty: (5 + len) ^ alpha / (5 + 1) ^ alpha
+                    seq_len = len(new_seq) - prompt_len
+                    lp = ((5.0 + seq_len) / 6.0) ** length_penalty
+                    normalized_logp = new_logp / lp
+                    finished_beams.append((new_seq, normalized_logp, z_cache, True))
+                else:
+                    # Update cache for the new token
+                    new_z_cache = [z.clone() for z in z_cache]
+                    z_new = model.token_embed(new_token).squeeze(0).unsqueeze(0)  # [1, dim]
+                    z_new = z_new + model.pos_bias(len(new_seq) - 1)
+                    for layer in model.layers:
+                        z_new = layer(z_new, new_z_cache, len(new_seq) - 1, num_steps=model.num_steps)
+                    new_z_cache.append(z_new)
+                    
+                    # Calculate diversity penalty: penalize tokens that appear too often in recent history
+                    recent_tokens = new_seq[-20:].tolist() if len(new_seq) > 20 else new_seq.tolist()
+                    token_count = recent_tokens.count(new_token.item())
+                    diversity_penalty = 0.1 * token_count if token_count > 2 else 0.0
+                    
+                    beam_candidates.append((new_seq, new_logp - diversity_penalty, new_z_cache, False))
+            
+            new_beams.extend(beam_candidates)
 
-        # Keep top beam_width, penalizing length slightly or just sorting
-        # Avoid duplicate sequences if any (though unlikely here)
+        if not new_beams:
+            # All beams finished
+            break
+            
+        # Remove duplicates and keep top beams
         unique_beams = {}
-        for s, l, c in new_beams:
+        for s, l, c, f in new_beams:
             s_tuple = tuple(s.tolist())
-            if s_tuple not in unique_beams or unique_beams[s_tuple][0] < l:
-                unique_beams[s_tuple] = (l, s, c)
+            if s_tuple not in unique_beams or unique_beams[s_tuple][1] < l:
+                unique_beams[s_tuple] = (s, l, c, f)
         
-        beams = sorted(unique_beams.values(), key=lambda x: x[0], reverse=True)[:beam_width]
-        beams = [(s, l, c) for l, s, c in beams]
+        # Sort by log probability and keep top beam_width
+        beams = sorted(unique_beams.values(), key=lambda x: x[1], reverse=True)[:beam_width]
 
-        # Early stop if ALL beams ended with EOT
-        if all(b[0][-1].item() == tokenizer.eot_token for b in beams):
+        # Early stop if we have enough good finished beams (but only after min_length)
+        if len(finished_beams) >= beam_width * 2 and step >= min_length:
             break
 
-    # Return best sequence
-    best_seq = beams[0][0]
-    return tokenizer.decode(best_seq.tolist())
+    # Combine active and finished beams
+    all_beams = finished_beams + beams
+    
+    if not all_beams:
+        # Fallback: return the prompt if something went wrong
+        return prompt
+    
+    # Apply final length penalty to remaining active beams
+    normalized_beams = []
+    for seq, logp, z_cache, is_finished in all_beams:
+        seq_len = len(seq) - prompt_len
+        
+        # Apply length penalty
+        lp = ((5.0 + seq_len) / 6.0) ** length_penalty
+        normalized_logp = logp / lp
+        
+        # Bonus for finished beams with good length
+        if is_finished and 40 <= seq_len <= 150:
+            normalized_logp += 0.5
+        
+        normalized_beams.append((seq, normalized_logp))
+    
+    # Sort by normalized score and pick the best
+    best_seq = max(normalized_beams, key=lambda x: x[1])[0]
+    
+    # Decode and clean up output
+    decoded = tokenizer.decode(best_seq.tolist())
+    
+    # Remove duplicate EOT tokens in the output
+    eot_str = tokenizer.decode([tokenizer.eot_token])
+    if eot_str in decoded:
+        # Keep only text up to first EOT token
+        decoded = decoded.split(eot_str)[0]
+    
+    return decoded
 
 # ────────────────────────────────────────────────────────────────
 #  Run
@@ -899,6 +981,7 @@ if __name__ == "__main__":
     parser.add_argument("--prompt", type=str, default="Once upon a time there was a little girl who loved to", help="Prompt for generation")
     parser.add_argument("--beam", action="store_true", help="Use beam search for generation")
     parser.add_argument("--beam_width", type=int, default=BEAM_WIDTH, help="Beam width")
+    parser.add_argument("--temperature", type=float, default=TEMPERATURE, help="Sampling temperature for generation")
     parser.add_argument("--test", action="store_true", help="Run final test suite")
     parser.add_argument("--rl_train", action="store_true", help="Start RLVR self-improvement training")
     parser.add_argument("--lora", action="store_true", help="Use Low-Rank Adaptation (LoRA) for fine-tuning")
@@ -934,9 +1017,9 @@ if __name__ == "__main__":
         print("\n" + "="*90)
         print(f"Test prompt: {args.prompt!r}")
         if args.beam:
-            print(f"Generating with Beam Search (width={args.beam_width})...")
-            generated = beam_search_generate(args.prompt, beam_width=args.beam_width)
+            print(f"Generating with Beam Search (width={args.beam_width}, temperature={args.temperature})...")
+            generated = beam_search_generate(args.prompt, beam_width=args.beam_width, temperature=args.temperature)
         else:
-            print("Generating with Greedy Decoding...")
-            generated = generate(args.prompt)
+            print(f"Generating with Greedy Decoding (temperature={args.temperature})...")
+            generated = generate(args.prompt, temperature=args.temperature)
         print(f"Generated continuation:\n{generated}")
