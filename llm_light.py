@@ -87,12 +87,12 @@ H = 4                # Number of parallel attention heads in the modulator
 M = 32               # Internal evolution steps (temporal depth) per layer
 LAYERS_DEFAULT = 4   # Default number of cascaded interference stages
 INITIAL_COUPLING = 0.5      # Initial coupling strength between field and candidate
-SEQ_LEN = 64        # Context window length for training samples
+SEQ_LEN = 32        # Context window length for training samples
 BATCH_SIZE = 8       # Number of sequences processed in parallel
 EPOCHS = 15          # Total training passes over the dataset
 STEPS_PER_EPOCH = 200 # number of weight updates per epoch
 LR = 4e-4            # Initial learning rate for Adam optimizer
-EMBED_DIM = 128       # Scaling up capacity (32 complex dimensions)
+EMBED_DIM = 64       # Scaling up capacity (32 complex dimensions)
 BEAM_WIDTH = 5       # Number of candidate beams maintained in beam search
 REL_MAX_DIST = 64    # Max relative distance for unique positional biases
 GRAD_CLIP = 1.0      # Maximum gradient norm to prevent explosions
@@ -267,91 +267,46 @@ class QuantumWaveModulator(torch.nn.Module):
     """
     def __init__(self, m_steps=M, dim=EMBED_DIM):
         super().__init__()
+        # Coin matrix (Fixed Unitary)
+        self.register_buffer("coin", torch.tensor([
+            [1.0 + 0.0j, 0.0 + 1.0j],
+            [0.0 + 1.0j, 1.0 + 0.0j]
+        ], dtype=torch.complex64) / (2.0**0.5))
         
-        # Learnable phase shifts (matrices of shape [M, dim])
-        self.phase_u = torch.nn.Parameter(torch.zeros(m_steps, dim))
-        self.phase_v = torch.nn.Parameter(torch.zeros(m_steps, dim))
-        
-        # Cached phase exponentials for speed with dirty flag
-        self.register_buffer('_phase_exp_u_cache', None, persistent=False)
-        self.register_buffer('_phase_exp_v_cache', None, persistent=False)
-        self.register_buffer('_cache_valid', torch.tensor(False), persistent=False)
-    
-    def invalidate_cache(self):
-        """Mark cache as invalid (call after optimizer.step())"""
-        self._cache_valid = torch.tensor(False)
-    
-    def _update_cache(self):
-        """Update phase exponential cache"""
-        self._phase_exp_u_cache = torch.exp(1j * self.phase_u)
-        self._phase_exp_v_cache = torch.exp(1j * self.phase_v)
-        self._cache_valid = torch.tensor(True)
+        # Learnable phase shifts (vectors)
+        self.phase_u = torch.nn.Parameter(torch.zeros(dim))
+        self.phase_v = torch.nn.Parameter(torch.zeros(dim))
 
-    def forward(self, curr_pos, z_curr, z_past_stacked, m: int = 0, coupling=INITIAL_COUPLING):
-        # z_curr: [B, dim], z_past_stacked: [T, B, dim] or [1, B, dim]
+    def forward(self, curr_pos, z_curr, z_past_stacked, coupling=INITIAL_COUPLING):
         if z_past_stacked is None:
             return torch.zeros_like(z_curr)
             
         # 1. Capture the 'previous' state from the historical field
-        # Ensure we take the last time step AND ensure B matches
-        u_prev = z_past_stacked[-1] # [B, dim]
-
-        # Safety broadcast in case z_past B=1 and current B>1 (beam search)
-        if u_prev.size(0) != z_curr.size(0) and u_prev.size(0) == 1:
-            u_prev = u_prev.expand(z_curr.size(0), -1)
-
-        v_curr = z_curr             # [B, dim]
+        # In a multi-layer cascade, we often look at the immediate predecessor
+        u_prev = z_past_stacked[-1] # [dim]
+        v_curr = z_curr             # [dim]
         
-        # 2. Apply learnable phase rotations (with smart caching)
-        if not self._cache_valid:
-            self._update_cache()
+        # 2. Apply learnable phase rotations before interference
+        # exp(i * phase)
+        u_prev = u_prev * torch.exp(1j * self.phase_u)
+        v_curr = v_curr * torch.exp(1j * self.phase_v)
         
-        u_prev = u_prev * self._phase_exp_u_cache[m]
-        v_curr = v_curr * self._phase_exp_v_cache[m]
+        # 3. Apply Unitary Coin (Interference)
+        state = torch.stack([u_prev, v_curr], dim=0) # [2, dim]
+        out = (self.coin * coupling) @ state # [2, dim]
         
-        # 3. Dynamic Beam Splitter (Coin) based on Coupling C
-        # C = r^2 = 1 - t^2  => r = sqrt(C), t = sqrt(1-C)
-        if torch.is_tensor(coupling):
-            C = torch.clamp(coupling, 0.0, 1.0)
-        else:
-            C = max(0.0, min(1.0, coupling))
-            
-        r = torch.sqrt(torch.clamp(C, min=0.0, max=1.0))
-        t = torch.sqrt(torch.clamp(1.0 - C, min=0.0, max=1.0))
-        
-        # Physical Beam Splitter Matrix Operation:
-        # | u' |   | t   i*r | | u |
-        # | v' | = | i*r t   | | v |
-        
-        u_prime = t * u_prev + 1j * r * v_curr
-        v_prime = 1j * r * u_prev + t * v_curr
-        
-        # 4. Optimized Ballistic Shift with Reflecting Boundaries
-        # Shift along dim=-1 (embedding dimension)
-        # u moves right (+1): [last, 0, 1, ..., N-2]
-        # v moves left (-1): [1, 2, ..., N-1, 0]
-        
-        u_prime = u_prime.contiguous()
-        v_prime = v_prime.contiguous()
-        
-        u_shifted = torch.cat((u_prime[..., -1:], u_prime[..., :-1]), dim=-1)
-        u_shifted[..., 0] = v_prime[..., 0]  # Reflect at left boundary
-        
-        v_shifted = torch.cat((v_prime[..., 1:], v_prime[..., :1]), dim=-1)
-        v_shifted[..., -1] = u_prime[..., -1]  # Reflect at right boundary
-        
-        return u_shifted + v_shifted
+        return out[0] # [dim]
 
 class PhotonicInterferenceLayer(torch.nn.Module):
     """One full interference layer/block"""
-    def __init__(self, mode="neural", num_steps=M, dim=EMBED_DIM, use_lora=False, lora_rank=4, quant_bits=None):
+    def __init__(self, mode="neural", use_lora=False, lora_rank=4, quant_bits=None):
         super().__init__()
         self.mode = mode
         if mode == "neural":
             self.modulator = MultiHeadModulator(dim=dim, use_lora=use_lora, lora_rank=lora_rank, quant_bits=quant_bits)
         else:
-            self.modulator = QuantumWaveModulator(m_steps=num_steps, dim=dim)
-        self.coupling = torch.nn.Parameter(torch.full((num_steps,), INITIAL_COUPLING))
+            self.modulator = QuantumWaveModulator(dim=EMBED_DIM)
+        self.coupling = torch.nn.Parameter(torch.full((M,), INITIAL_COUPLING))
         self.norm_scale = torch.nn.Parameter(torch.tensor(1.0))
 
     def forward(self, candidate, z_cache, pos, num_steps=M):
@@ -372,28 +327,25 @@ class PhotonicInterferenceLayer(torch.nn.Module):
             else:
                 c = self.coupling[m] # Multi-stage adaptive coupling
                 if self.mode == "wave":
-                    # Modulator now returns full unitary update, so we don't add (1-c)*z_new
-                    z_new = self.modulator(pos, z_new, z_past_stacked, m=m, coupling=c)
+                    mod_factor = self.modulator(pos, z_new, z_past_stacked, coupling=c)
+                    z_new = mod_factor + (1 - c) * z_new
                 else:
                     mod_factor = self.modulator(pos, z_new, z_past_stacked, m=m)
                     z_new = z_new + c * mod_factor
 
-            # Photonic-style non-linearity (Bounded Tanh for stability)
-            z_new = bounded_activation(z_new.real) + 1j * bounded_activation(z_new.imag)
-        
-        # Normalization once after all M steps (optimization)
-        z_real = F.layer_norm(z_new.real, (z_new.real.size(-1),))
-        z_imag = F.layer_norm(z_new.imag, (z_new.imag.size(-1),))
-        z_new = (z_real + 1j * z_imag) * self.norm_scale
+            # Photonic-style non-linearity (Mish) and normalization
+            z_new = mish(z_new.real) + 1j * mish(z_new.imag)
+            # Complex LayerNorm (real and imag independently) + learned scaling
+            z_real = F.layer_norm(z_new.real, (z_new.real.size(-1),))
+            z_imag = F.layer_norm(z_new.imag, (z_new.imag.size(-1),))
+            z_new = (z_real + 1j * z_imag) * self.norm_scale
             
         return z_new
 
 class MultiLayerPhotonicNN(torch.nn.Module):
-    def __init__(self, num_layers=LAYERS_DEFAULT, num_steps=M, dim=EMBED_DIM, mode="neural", use_lora=False, lora_rank=4, quant_bits=None):
+    def __init__(self, num_layers=LAYERS_DEFAULT, mode="neural", use_lora=False, lora_rank=4, quant_bits=None):
         super().__init__()
         self.num_layers = num_layers
-        self.num_steps = num_steps
-        self.dim = dim
         self.mode = mode
         self.use_lora = use_lora
         self.lora_rank = lora_rank
@@ -402,7 +354,7 @@ class MultiLayerPhotonicNN(torch.nn.Module):
         self.token_embed = TokenEmbedding(VOCAB_SIZE, dim=dim)
         self.pos_bias = RelativePositionalBias(dim=dim)
         self.layers = torch.nn.ModuleList([
-            PhotonicInterferenceLayer(mode=mode, num_steps=num_steps, dim=dim, use_lora=use_lora, lora_rank=lora_rank, quant_bits=quant_bits) for _ in range(num_layers)
+            PhotonicInterferenceLayer(mode=mode, use_lora=use_lora, lora_rank=lora_rank, quant_bits=quant_bits) for _ in range(num_layers)
         ])
         self.readout = ReadoutHead(dim=dim, use_lora=use_lora, quant_bits=quant_bits)
 
@@ -432,11 +384,11 @@ optimizer = None
 scheduler = None
 current_mode = "neural" # default
 
-def init_model(mode="neural", num_layers=LAYERS_DEFAULT, num_steps=M, dim=EMBED_DIM, use_lora=False, lora_rank=4, quant_bits=None):
+def init_model(mode="neural", num_layers=LAYERS_DEFAULT, use_lora=False, lora_rank=4, quant_bits=None):
     global model, optimizer, scheduler, current_mode
     current_mode = mode # Keep current_mode updated globally
-    model = MultiLayerPhotonicNN(num_layers=num_layers, num_steps=num_steps, dim=dim, mode=mode, use_lora=use_lora, lora_rank=lora_rank, quant_bits=quant_bits).to(DEVICE)
-    print(f"Photonic Model Initialized (Mode: {mode}, Layers: {num_layers}, M: {num_steps}, Dim: {dim}, LoRA: {use_lora} (rank {lora_rank}), Quant: {quant_bits}-bit)")
+    model = MultiLayerPhotonicNN(num_layers=num_layers, mode=mode, use_lora=use_lora, lora_rank=lora_rank, quant_bits=quant_bits).to(DEVICE)
+    print(f"Photonic Model Initialized (Mode: {mode}, Layers: {num_layers}, LoRA: {use_lora} (rank {lora_rank}), Quant: {quant_bits}-bit)")
     optimizer = optim.Adam(model.parameters(), lr=LR)
     scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=LR*0.05)
 
@@ -447,8 +399,6 @@ def save_checkpoint(path=None):
         'scheduler_state': scheduler.state_dict(),
         'mode': model.mode,
         'num_layers': model.num_layers,
-        'num_steps': model.num_steps,
-        'dim': model.dim,
         'use_lora': model.use_lora,
         'lora_rank': model.lora_rank,
         'quant_bits': model.quant_bits
@@ -505,18 +455,16 @@ def load_checkpoint(path="model.pth"):
     mismatch = False
     if saved_mode != model.mode: mismatch = True
     if saved_layers != model.num_layers: mismatch = True
-    if saved_steps != model.num_steps: mismatch = True
-    if saved_dim != model.dim: mismatch = True
     if saved_lora != model.use_lora: mismatch = True
     if saved_rank != model.lora_rank: mismatch = True
     if saved_quant != model.quant_bits: mismatch = True
 
     if mismatch:
         print(f"\n[!] Architecture mismatch detected!")
-        print(f"    Current Configuration:   Mode={model.mode}, Layers={model.num_layers}, M={model.num_steps}, Dim={model.dim}, LoRA={model.use_lora}, Rank={model.lora_rank}, Quant={model.quant_bits}")
-        print(f"    Checkpoint Configuration: Mode={saved_mode}, Layers={saved_layers}, M={saved_steps}, Dim={saved_dim}, LoRA={saved_lora}, Rank={saved_rank}, Quant={saved_quant}")
+        print(f"    Current Configuration:   Mode={model.mode}, Layers={model.num_layers}, LoRA={model.use_lora}, Rank={model.lora_rank}, Quant={model.quant_bits}")
+        print(f"    Checkpoint Configuration: Mode={saved_mode}, Layers={saved_layers}, LoRA={saved_lora}, Rank={saved_rank}, Quant={saved_quant}")
         print(f"    Re-initializing model to match checkpoint...\n")
-        init_model(mode=saved_mode, num_layers=saved_layers, num_steps=saved_steps, dim=saved_dim, use_lora=saved_lora, lora_rank=saved_rank, quant_bits=saved_quant)
+        init_model(mode=saved_mode, num_layers=saved_layers, use_lora=saved_lora, lora_rank=saved_rank, quant_bits=saved_quant)
 
     # If LoRA was active, we must re-filter the optimizer before loading its state
     if saved_lora:
@@ -897,14 +845,9 @@ def beam_search_generate(prompt: str, beam_width=BEAM_WIDTH, max_new=180, temper
                 continue
 
             # Get logits for the LAST token in the current sequence
-            logits = model.readout(z_cache[-1]).squeeze(0)  # [vocab]
-            
-            # Suppress EOT token probability until minimum length is reached
-            if step < min_length:
-                logits[tokenizer.eot_token] = -float('inf')
-            
-            # Apply temperature and compute probabilities
-            logits = logits / effective_temp
+            # Wait, the way incremental works: we need the z_cache to produce logits for NEXT token
+            # z_cache[-1] already went through layers, so readout(z_cache[-1]) gives next token logits
+            logits = model.readout(z_cache[-1]) / temperature
             probs = F.softmax(logits, dim=-1)
             
             # Expand beam with top-k candidates (more candidates for better exploration)
@@ -920,60 +863,23 @@ def beam_search_generate(prompt: str, beam_width=BEAM_WIDTH, max_new=180, temper
                 token_prob = top_probs[k].item()
                 if token_prob < 1e-10:
                     continue
-                k_indices.append(k)
-                valid_new_tokens.append(top_ids[k])
-                valid_token_probs.append(token_prob)
-            
-            if not k_indices:
-                continue
 
-            num_candidates = len(k_indices)
-            candidate_tokens = torch.stack(valid_new_tokens) # [K]
-            
-            # Batch forward pass
-            # 1. Embed candidates
-            z_cands = model.token_embed(candidate_tokens) # [K, Dim]
-            # 2. Add Positional Bias (broadcasts)
-            z_cands = z_cands + model.pos_bias(len(seq))
-            
-            # 3. Run Layers (Batched)
-            # z_cache is shared from parent beam
-            for layer in model.layers:
-                z_cands = layer(z_cands, z_cache, len(seq), num_steps=model.num_steps)
-            
-            # 4. Create new beams
-            beam_candidates = []
-            for i, k in enumerate(k_indices):
-                new_token = valid_new_tokens[i].unsqueeze(0) # [1]
-                new_logp = logp + torch.log(torch.tensor(valid_token_probs[i] + 1e-12)).item()
                 new_seq = torch.cat([seq, new_token])
                 
-                new_is_finished = (new_token.item() == tokenizer.eot_token) and (step >= min_length)
+                # Update cache for the new token
+                current_pos = len(seq)
+                z_curr = model.token_embed(new_token).squeeze(0)
+                z_curr = z_curr + model.pos_bias(current_pos)
                 
-                if new_is_finished:
-                    seq_len = len(new_seq) - prompt_len
-                    lp = ((5.0 + seq_len) / 6.0) ** length_penalty
-                    normalized_logp = new_logp / lp
-                    finished_beams.append((new_seq, normalized_logp, z_cache, True))
-                else:
-                    new_z_final = z_cands[i].unsqueeze(0) # [1, Dim]
-                    new_z_cache = [z.clone() for z in z_cache]
-                    new_z_cache.append(new_z_final)
-                    
-                    # Diversity penalty
-                    recent_tokens = new_seq[-20:].tolist() if len(new_seq) > 20 else new_seq.tolist()
-                    token_count = recent_tokens.count(new_token.item())
-                    diversity_penalty = 0.1 * token_count if token_count > 2 else 0.0
-                    
-                    beam_candidates.append((new_seq, new_logp - diversity_penalty, new_z_cache, False))
-            
-            new_beams.extend(beam_candidates)
+                new_z_cache = z_cache.copy()
+                for layer in model.layers:
+                    z_curr = layer(z_curr, new_z_cache, current_pos, num_steps=M)
+                new_z_cache.append(z_curr)
+                
+                new_beams.append((new_seq, new_logp, new_z_cache))
 
-        if not new_beams:
-            # All beams finished
-            break
-            
-        # Remove duplicates and keep top beams
+        # Keep top beam_width, penalizing length slightly or just sorting
+        # Avoid duplicate sequences if any (though unlikely here)
         unique_beams = {}
         for s, l, c, f in new_beams:
             s_tuple = tuple(s.tolist())
