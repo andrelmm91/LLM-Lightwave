@@ -15,8 +15,14 @@ from datetime import datetime
 #  Utils
 # ────────────────────────────────────────────────────────────────
 def mish(x):
-    """Mish activation function: x * tanh(softplus(x))"""
+    """Mish activation function: x * tanh(softplus(x))
+    NOTE: Deprecated in favor of tanh for stability in Wave Mode"""
     return x * torch.tanh(F.softplus(x))
+
+def bounded_activation(x):
+    """Bounded activation using tanh to prevent magnitude explosion
+    Strictly bounded to (-1, 1) ensuring energy conservation in Wave Mode"""
+    return torch.tanh(x)
 
 def simulate_quantization(weight, bits=4):
     """Simulate symmetric linear quantization during training"""
@@ -91,6 +97,7 @@ BEAM_WIDTH = 5       # Number of candidate beams maintained in beam search
 REL_MAX_DIST = 64    # Max relative distance for unique positional biases
 GRAD_CLIP = 1.0      # Maximum gradient norm to prevent explosions
 VAL_STEPS = 100      # Number of validation chunks to sample each epoch
+TEMPERATURE = 0.7   # Sampling temperature for generation (lower = more focused, higher = more random)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
@@ -266,75 +273,51 @@ class QuantumWaveModulator(torch.nn.Module):
             [0.0 + 1.0j, 1.0 + 0.0j]
         ], dtype=torch.complex64) / (2.0**0.5))
         
-        # Learnable phase shifts (matrices of shape [M, dim])
-        self.phase_u = torch.nn.Parameter(torch.zeros(m_steps, dim))
-        self.phase_v = torch.nn.Parameter(torch.zeros(m_steps, dim))
-        
-        # Cached phase exponentials for speed with dirty flag
-        self.register_buffer('_phase_exp_u_cache', None)
-        self.register_buffer('_phase_exp_v_cache', None)
-        self.register_buffer('_cache_valid', torch.tensor(False))
-    
-    def invalidate_cache(self):
-        """Mark cache as invalid (call after optimizer.step())"""
-        self._cache_valid = torch.tensor(False)
-    
-    def _update_cache(self):
-        """Update phase exponential cache"""
-        self._phase_exp_u_cache = torch.exp(1j * self.phase_u)
-        self._phase_exp_v_cache = torch.exp(1j * self.phase_v)
-        self._cache_valid = torch.tensor(True)
+        # Learnable phase shifts (vectors)
+        self.phase_u = torch.nn.Parameter(torch.zeros(dim))
+        self.phase_v = torch.nn.Parameter(torch.zeros(dim))
 
-    def forward(self, curr_pos, z_curr, z_past_stacked, m: int = 0, coupling=INITIAL_COUPLING):
-        # z_curr: [B, dim], z_past_stacked: [T, B, dim]
+    def forward(self, curr_pos, z_curr, z_past_stacked, coupling=INITIAL_COUPLING):
         if z_past_stacked is None:
             return torch.zeros_like(z_curr)
             
         # 1. Capture the 'previous' state from the historical field
-        u_prev = z_past_stacked[-1] # [B, dim]
-        v_curr = z_curr             # [B, dim]
+        # In a multi-layer cascade, we often look at the immediate predecessor
+        u_prev = z_past_stacked[-1] # [dim]
+        v_curr = z_curr             # [dim]
         
-        # 2. Apply learnable phase rotations (with smart caching)
-        if not self._cache_valid:
-            self._update_cache()
-        
-        u_prev = u_prev * self._phase_exp_u_cache[m]
-        v_curr = v_curr * self._phase_exp_v_cache[m]
+        # 2. Apply learnable phase rotations before interference
+        # exp(i * phase)
+        u_prev = u_prev * torch.exp(1j * self.phase_u)
+        v_curr = v_curr * torch.exp(1j * self.phase_v)
         
         # 3. Apply Unitary Coin (Interference)
-        state = torch.stack([u_prev, v_curr], dim=1) # [B, 2, dim]
-        out = (self.coin * coupling) @ state # [B, 2, dim]
+        state = torch.stack([u_prev, v_curr], dim=0) # [2, dim]
+        out = (self.coin * coupling) @ state # [2, dim]
         
-        # 4. Optimized Ballistic Shift with Reflecting Boundaries
-        u_prime = out[:, 0, :] # [B, dim]
-        v_prime = out[:, 1, :] # [B, dim]
-        
-        # Use torch.roll for efficient shifting
-        u_shifted = torch.roll(u_prime, shifts=1, dims=1)
-        u_shifted[:, 0] = v_prime[:, 0]  # Reflect at left boundary
-        
-        v_shifted = torch.roll(v_prime, shifts=-1, dims=1)
-        v_shifted[:, -1] = u_prime[:, -1]  # Reflect at right boundary
-        
-        return u_shifted + v_shifted
+        return out[0] # [dim]
 
 class PhotonicInterferenceLayer(torch.nn.Module):
     """One full interference layer/block"""
-    def __init__(self, mode="neural", num_steps=M, use_lora=False, lora_rank=4, quant_bits=None):
+    def __init__(self, mode="neural", use_lora=False, lora_rank=4, quant_bits=None):
         super().__init__()
         self.mode = mode
         if mode == "neural":
-            self.modulator = MultiHeadModulator(use_lora=use_lora, lora_rank=lora_rank, quant_bits=quant_bits)
+            self.modulator = MultiHeadModulator(dim=dim, use_lora=use_lora, lora_rank=lora_rank, quant_bits=quant_bits)
         else:
-            self.modulator = QuantumWaveModulator(m_steps=num_steps, dim=EMBED_DIM)
-        self.coupling = torch.nn.Parameter(torch.full((num_steps,), INITIAL_COUPLING))
+            self.modulator = QuantumWaveModulator(dim=EMBED_DIM)
+        self.coupling = torch.nn.Parameter(torch.full((M,), INITIAL_COUPLING))
         self.norm_scale = torch.nn.Parameter(torch.tensor(1.0))
 
     def forward(self, candidate, z_cache, pos, num_steps=M):
         z_new = candidate
         
         # Optimization: stack history once per token, not M times
-        z_past_stacked = torch.stack(z_cache) if z_cache else None
+        if self.mode == "wave" and z_cache:
+             # Wave mode only needs immediate neighbor (Markovian)
+             z_past_stacked = z_cache[-1].unsqueeze(0)
+        else:
+             z_past_stacked = torch.stack(z_cache) if z_cache else None
         
         # Internal temporal evolution loop
         for m in range(num_steps):
@@ -344,38 +327,36 @@ class PhotonicInterferenceLayer(torch.nn.Module):
             else:
                 c = self.coupling[m] # Multi-stage adaptive coupling
                 if self.mode == "wave":
-                    mod_factor = self.modulator(pos, z_new, z_past_stacked, m=m, coupling=c)
+                    mod_factor = self.modulator(pos, z_new, z_past_stacked, coupling=c)
                     z_new = mod_factor + (1 - c) * z_new
                 else:
                     mod_factor = self.modulator(pos, z_new, z_past_stacked, m=m)
                     z_new = z_new + c * mod_factor
 
-            # Photonic-style non-linearity (Mish)
+            # Photonic-style non-linearity (Mish) and normalization
             z_new = mish(z_new.real) + 1j * mish(z_new.imag)
-        
-        # Normalization once after all M steps (optimization)
-        z_real = F.layer_norm(z_new.real, (z_new.real.size(-1),))
-        z_imag = F.layer_norm(z_new.imag, (z_new.imag.size(-1),))
-        z_new = (z_real + 1j * z_imag) * self.norm_scale
+            # Complex LayerNorm (real and imag independently) + learned scaling
+            z_real = F.layer_norm(z_new.real, (z_new.real.size(-1),))
+            z_imag = F.layer_norm(z_new.imag, (z_new.imag.size(-1),))
+            z_new = (z_real + 1j * z_imag) * self.norm_scale
             
         return z_new
 
 class MultiLayerPhotonicNN(torch.nn.Module):
-    def __init__(self, num_layers=LAYERS_DEFAULT, num_steps=M, mode="neural", use_lora=False, lora_rank=4, quant_bits=None):
+    def __init__(self, num_layers=LAYERS_DEFAULT, mode="neural", use_lora=False, lora_rank=4, quant_bits=None):
         super().__init__()
         self.num_layers = num_layers
-        self.num_steps = num_steps
         self.mode = mode
         self.use_lora = use_lora
         self.lora_rank = lora_rank
         self.quant_bits = quant_bits
         
-        self.token_embed = TokenEmbedding(VOCAB_SIZE)
-        self.pos_bias = RelativePositionalBias()
+        self.token_embed = TokenEmbedding(VOCAB_SIZE, dim=dim)
+        self.pos_bias = RelativePositionalBias(dim=dim)
         self.layers = torch.nn.ModuleList([
-            PhotonicInterferenceLayer(mode=mode, num_steps=num_steps, use_lora=use_lora, lora_rank=lora_rank, quant_bits=quant_bits) for _ in range(num_layers)
+            PhotonicInterferenceLayer(mode=mode, use_lora=use_lora, lora_rank=lora_rank, quant_bits=quant_bits) for _ in range(num_layers)
         ])
-        self.readout = ReadoutHead(use_lora=use_lora, quant_bits=quant_bits)
+        self.readout = ReadoutHead(dim=dim, use_lora=use_lora, quant_bits=quant_bits)
 
     def forward_incremental(self, batch_ids):
         # batch_ids: [Batch, SeqLen]
@@ -403,11 +384,11 @@ optimizer = None
 scheduler = None
 current_mode = "neural" # default
 
-def init_model(mode="neural", num_layers=LAYERS_DEFAULT, num_steps=M, use_lora=False, lora_rank=4, quant_bits=None):
+def init_model(mode="neural", num_layers=LAYERS_DEFAULT, use_lora=False, lora_rank=4, quant_bits=None):
     global model, optimizer, scheduler, current_mode
     current_mode = mode # Keep current_mode updated globally
-    model = MultiLayerPhotonicNN(num_layers=num_layers, num_steps=num_steps, mode=mode, use_lora=use_lora, lora_rank=lora_rank, quant_bits=quant_bits).to(DEVICE)
-    print(f"Photonic Model Initialized (Mode: {mode}, Layers: {num_layers}, M: {num_steps}, LoRA: {use_lora} (rank {lora_rank}), Quant: {quant_bits}-bit)")
+    model = MultiLayerPhotonicNN(num_layers=num_layers, mode=mode, use_lora=use_lora, lora_rank=lora_rank, quant_bits=quant_bits).to(DEVICE)
+    print(f"Photonic Model Initialized (Mode: {mode}, Layers: {num_layers}, LoRA: {use_lora} (rank {lora_rank}), Quant: {quant_bits}-bit)")
     optimizer = optim.Adam(model.parameters(), lr=LR)
     scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=LR*0.05)
 
@@ -418,7 +399,6 @@ def save_checkpoint(path=None):
         'scheduler_state': scheduler.state_dict(),
         'mode': model.mode,
         'num_layers': model.num_layers,
-        'num_steps': model.num_steps,
         'use_lora': model.use_lora,
         'lora_rank': model.lora_rank,
         'quant_bits': model.quant_bits
@@ -458,21 +438,33 @@ def load_checkpoint(path="model.pth"):
         saved_rank = model.lora_rank
         saved_quant = model.quant_bits
     
+    # Infer dim from state_dict if not in config
+    if 'dim' in checkpoint:
+        saved_dim = checkpoint['dim']
+    else:
+        # Infer from token embedding weight: [Vocab, Dim]
+        try:
+            saved_dim = model_state['token_embed.embed.weight'].shape[1]
+        except KeyError:
+            saved_dim = EMBED_DIM # fallback
+    
+    saved_layers = checkpoint.get('num_layers', saved_layers) # Use extracted or default
+    saved_steps = checkpoint.get('num_steps', saved_steps)
+
     # Detect and Resolve Architecture Mismatch
     mismatch = False
     if saved_mode != model.mode: mismatch = True
     if saved_layers != model.num_layers: mismatch = True
-    if saved_steps != model.num_steps: mismatch = True
     if saved_lora != model.use_lora: mismatch = True
     if saved_rank != model.lora_rank: mismatch = True
     if saved_quant != model.quant_bits: mismatch = True
 
     if mismatch:
         print(f"\n[!] Architecture mismatch detected!")
-        print(f"    Current Configuration:   Mode={model.mode}, Layers={model.num_layers}, M={model.num_steps}, LoRA={model.use_lora}, Rank={model.lora_rank}, Quant={model.quant_bits}")
-        print(f"    Checkpoint Configuration: Mode={saved_mode}, Layers={saved_layers}, M={saved_steps}, LoRA={saved_lora}, Rank={saved_rank}, Quant={saved_quant}")
+        print(f"    Current Configuration:   Mode={model.mode}, Layers={model.num_layers}, LoRA={model.use_lora}, Rank={model.lora_rank}, Quant={model.quant_bits}")
+        print(f"    Checkpoint Configuration: Mode={saved_mode}, Layers={saved_layers}, LoRA={saved_lora}, Rank={saved_rank}, Quant={saved_quant}")
         print(f"    Re-initializing model to match checkpoint...\n")
-        init_model(mode=saved_mode, num_layers=saved_layers, num_steps=saved_steps, use_lora=saved_lora, lora_rank=saved_rank, quant_bits=saved_quant)
+        init_model(mode=saved_mode, num_layers=saved_layers, use_lora=saved_lora, lora_rank=saved_rank, quant_bits=saved_quant)
 
     # If LoRA was active, we must re-filter the optimizer before loading its state
     if saved_lora:
@@ -484,6 +476,11 @@ def load_checkpoint(path="model.pth"):
         
         optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=LR)
         scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=LR*0.05)
+
+    # Filter out transient cache buffers from checkpoint to avoid warnings
+    keys_to_remove = [k for k in model_state.keys() if '_phase_exp_' in k or '_cache_valid' in k]
+    for k in keys_to_remove:
+        del model_state[k]
 
     missing_keys, unexpected_keys = model.load_state_dict(model_state, strict=False)
     if missing_keys:
@@ -694,7 +691,7 @@ def rl_train(steps=100, samples_per_step=4):
     torch.save(model.state_dict(), save_path)
     print(f"RL Fine-tuning finished. Saved to {save_path}")
 
-def rollout(prompt, max_new=50, temperature=0.9):
+def rollout(prompt, max_new=50, temperature=0.1):
     """Generate a sequence while tracking log-probabilities for RL"""
     prompt_tokens = torch.tensor(tokenizer.encode(prompt, disallowed_special=()), device=DEVICE)
     z_cache = []
@@ -705,7 +702,7 @@ def rollout(prompt, max_new=50, temperature=0.9):
         z_curr = model.token_embed(token_id).squeeze(0).unsqueeze(0)  # [1, dim]
         z_curr = z_curr + model.pos_bias(i)
         for layer in model.layers:
-            z_curr = layer(z_curr, z_cache, i, num_steps=M)
+            z_curr = layer(z_curr, z_cache, i, num_steps=model.num_steps)
         z_cache.append(z_curr)
         logits = model.readout(z_curr).squeeze(0)  # [vocab]
 
@@ -727,7 +724,7 @@ def rollout(prompt, max_new=50, temperature=0.9):
         z_curr = model.token_embed(next_token).squeeze(0).unsqueeze(0)  # [1, dim]
         z_curr = z_curr + model.pos_bias(current_pos)
         for layer in model.layers:
-            z_curr = layer(z_curr, z_cache, current_pos, num_steps=M)
+            z_curr = layer(z_curr, z_cache, current_pos, num_steps=model.num_steps)
         z_cache.append(z_curr)
         logits = model.readout(z_curr).squeeze(0)  # [vocab]
         current_pos += 1
@@ -764,7 +761,7 @@ def run_final_tests():
 #  Generation with real tokenizer
 # ────────────────────────────────────────────────────────────────
 @torch.no_grad()
-def generate(prompt: str, max_new=180, temperature=0.92):
+def generate(prompt: str, max_new=180, temperature=TEMPERATURE):
     prompt_tokens = torch.tensor(tokenizer.encode(prompt, disallowed_special=()), device=DEVICE)
     z_cache = []
 
@@ -776,7 +773,7 @@ def generate(prompt: str, max_new=180, temperature=0.92):
         z_curr = z_curr + model.pos_bias(i)
         
         for layer in model.layers:
-            z_curr = layer(z_curr, z_cache, i, num_steps=M)
+            z_curr = layer(z_curr, z_cache, i, num_steps=model.num_steps)
         z_cache.append(z_curr)
         logits = model.readout(z_curr).squeeze(0)  # [vocab]
 
@@ -797,7 +794,7 @@ def generate(prompt: str, max_new=180, temperature=0.92):
         z_curr = z_curr + model.pos_bias(current_pos)
         
         for layer in model.layers:
-            z_curr = layer(z_curr, z_cache, current_pos, num_steps=M)
+            z_curr = layer(z_curr, z_cache, current_pos, num_steps=model.num_steps)
         z_cache.append(z_curr)
         logits = model.readout(z_curr).squeeze(0)  # [vocab]
         current_pos += 1
@@ -808,12 +805,18 @@ def generate(prompt: str, max_new=180, temperature=0.92):
 #  Beam Search Generation
 # ────────────────────────────────────────────────────────────────
 @torch.no_grad()
-def beam_search_generate(prompt: str, beam_width=BEAM_WIDTH, max_new=180, temperature=0.9):
+def beam_search_generate(prompt: str, beam_width=BEAM_WIDTH, max_new=180, temperature=TEMPERATURE, length_penalty=0.6, min_length=40):
     model.eval()
     prompt_tokens = torch.tensor(tokenizer.encode(prompt, disallowed_special=()), device=DEVICE)
     prompt_len = len(prompt_tokens)
+    
+    # For beam search, ensure temperature isn't too low (causes beam collapse)
+    # Beam search works best with temperature >= 0.7 for diversity
+    effective_temp = max(temperature, 0.7)
+    if temperature < 0.7:
+        print(f"Note: Temperature {temperature} is too low for beam search. Using {effective_temp} instead.")
 
-    # Beam element: (sequence_tensor, log_prob, z_cache_list)
+    # Beam element: (sequence_tensor, log_prob, z_cache_list, is_finished)
     # Start with prefilling the cache for the prompt
     z_cache_init = []
     logits = None
@@ -826,55 +829,105 @@ def beam_search_generate(prompt: str, beam_width=BEAM_WIDTH, max_new=180, temper
         z_cache_init.append(z_curr)
         logits = model.readout(z_curr).squeeze(0)  # [vocab]
 
-    beams = [(prompt_tokens.clone(), 0.0, z_cache_init)]
+    beams = [(prompt_tokens.clone(), 0.0, z_cache_init, False)]
+    finished_beams = []
 
+    print(f"Generating ({max_new} steps)...")
     for step in range(max_new):
+        if step % 5 == 0:
+            print(f"Step {step}/{max_new} | Beams: {len(beams)} | Finished: {len(finished_beams)}")
         new_beams = []
-        for seq, logp, z_cache in beams:
-            # Get logits for the LAST token in the current sequence
-            logits = model.readout(z_cache[-1]).squeeze(0) / temperature  # [vocab]
-            probs = F.softmax(logits, dim=-1)
-            top_probs, top_ids = probs.topk(beam_width)
+        
+        for seq, logp, z_cache, is_finished in beams:
+            # If beam is already finished, add to finished list
+            if is_finished:
+                finished_beams.append((seq, logp, z_cache, is_finished))
+                continue
 
-            for k in range(beam_width):
-                new_token = top_ids[k:k+1]
-                new_logp = logp + torch.log(top_probs[k] + 1e-10).item()
-                
-                # Check if it was already EOT
-                if seq[-1].item() == tokenizer.eot_token:
-                    new_beams.append((seq, logp, z_cache))
+            # Get logits for the LAST token in the current sequence
+            # Wait, the way incremental works: we need the z_cache to produce logits for NEXT token
+            # z_cache[-1] already went through layers, so readout(z_cache[-1]) gives next token logits
+            logits = model.readout(z_cache[-1]) / temperature
+            probs = F.softmax(logits, dim=-1)
+            
+            # Expand beam with top-k candidates (more candidates for better exploration)
+            top_probs, top_ids = probs.topk(beam_width * 3)
+
+            # Batch evaluation of candidates for speed
+            # Filter valid candidates first
+            k_indices = []
+            valid_new_tokens = []
+            valid_token_probs = []
+            
+            for k in range(min(beam_width * 3, len(top_ids))):
+                token_prob = top_probs[k].item()
+                if token_prob < 1e-10:
                     continue
 
                 new_seq = torch.cat([seq, new_token])
                 
                 # Update cache for the new token
-                new_z_cache = [z.clone() for z in z_cache]
-                z_new = model.token_embed(new_token).squeeze(0).unsqueeze(0)  # [1, dim]
-                z_new = z_new + model.pos_bias(len(new_seq) - 1)
+                current_pos = len(seq)
+                z_curr = model.token_embed(new_token).squeeze(0)
+                z_curr = z_curr + model.pos_bias(current_pos)
+                
+                new_z_cache = z_cache.copy()
                 for layer in model.layers:
-                    z_new = layer(z_new, new_z_cache, len(new_seq) - 1, num_steps=model.num_steps)
-                new_z_cache.append(z_new)
+                    z_curr = layer(z_curr, new_z_cache, current_pos, num_steps=M)
+                new_z_cache.append(z_curr)
                 
                 new_beams.append((new_seq, new_logp, new_z_cache))
 
         # Keep top beam_width, penalizing length slightly or just sorting
         # Avoid duplicate sequences if any (though unlikely here)
         unique_beams = {}
-        for s, l, c in new_beams:
+        for s, l, c, f in new_beams:
             s_tuple = tuple(s.tolist())
-            if s_tuple not in unique_beams or unique_beams[s_tuple][0] < l:
-                unique_beams[s_tuple] = (l, s, c)
+            if s_tuple not in unique_beams or unique_beams[s_tuple][1] < l:
+                unique_beams[s_tuple] = (s, l, c, f)
         
-        beams = sorted(unique_beams.values(), key=lambda x: x[0], reverse=True)[:beam_width]
-        beams = [(s, l, c) for l, s, c in beams]
+        # Sort by log probability and keep top beam_width
+        beams = sorted(unique_beams.values(), key=lambda x: x[1], reverse=True)[:beam_width]
 
-        # Early stop if ALL beams ended with EOT
-        if all(b[0][-1].item() == tokenizer.eot_token for b in beams):
+        # Early stop if we have enough good finished beams (but only after min_length)
+        if len(finished_beams) >= beam_width * 2 and step >= min_length:
             break
 
-    # Return best sequence
-    best_seq = beams[0][0]
-    return tokenizer.decode(best_seq.tolist())
+    # Combine active and finished beams
+    all_beams = finished_beams + beams
+    
+    if not all_beams:
+        # Fallback: return the prompt if something went wrong
+        return prompt
+    
+    # Apply final length penalty to remaining active beams
+    normalized_beams = []
+    for seq, logp, z_cache, is_finished in all_beams:
+        seq_len = len(seq) - prompt_len
+        
+        # Apply length penalty
+        lp = ((5.0 + seq_len) / 6.0) ** length_penalty
+        normalized_logp = logp / lp
+        
+        # Bonus for finished beams with good length
+        if is_finished and 40 <= seq_len <= 150:
+            normalized_logp += 0.5
+        
+        normalized_beams.append((seq, normalized_logp))
+    
+    # Sort by normalized score and pick the best
+    best_seq = max(normalized_beams, key=lambda x: x[1])[0]
+    
+    # Decode and clean up output
+    decoded = tokenizer.decode(best_seq.tolist())
+    
+    # Remove duplicate EOT tokens in the output
+    eot_str = tokenizer.decode([tokenizer.eot_token])
+    if eot_str in decoded:
+        # Keep only text up to first EOT token
+        decoded = decoded.split(eot_str)[0]
+    
+    return decoded
 
 # ────────────────────────────────────────────────────────────────
 #  Run
@@ -893,6 +946,7 @@ if __name__ == "__main__":
     parser.add_argument("--prompt", type=str, default="Once upon a time there was a little girl who loved to", help="Prompt for generation")
     parser.add_argument("--beam", action="store_true", help="Use beam search for generation")
     parser.add_argument("--beam_width", type=int, default=BEAM_WIDTH, help="Beam width")
+    parser.add_argument("--temperature", type=float, default=TEMPERATURE, help="Sampling temperature for generation")
     parser.add_argument("--test", action="store_true", help="Run final test suite")
     parser.add_argument("--rl_train", action="store_true", help="Start RLVR self-improvement training")
     parser.add_argument("--lora", action="store_true", help="Use Low-Rank Adaptation (LoRA) for fine-tuning")
@@ -928,9 +982,9 @@ if __name__ == "__main__":
         print("\n" + "="*90)
         print(f"Test prompt: {args.prompt!r}")
         if args.beam:
-            print(f"Generating with Beam Search (width={args.beam_width})...")
-            generated = beam_search_generate(args.prompt, beam_width=args.beam_width)
+            print(f"Generating with Beam Search (width={args.beam_width}, temperature={args.temperature})...")
+            generated = beam_search_generate(args.prompt, beam_width=args.beam_width, temperature=args.temperature)
         else:
-            print("Generating with Greedy Decoding...")
-            generated = generate(args.prompt)
+            print(f"Generating with Greedy Decoding (temperature={args.temperature})...")
+            generated = generate(args.prompt, temperature=args.temperature)
         print(f"Generated continuation:\n{generated}")
